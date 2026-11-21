@@ -17,6 +17,7 @@ from homeassistant.helpers.dispatcher import (
 )
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from . import poll_status
 from .capture import open_recorder
@@ -25,12 +26,19 @@ from .energy_guard import soc_of
 from .replay_guard import is_replay, odometer_from_state
 from .sentinel_guard import with_previous_unreported
 from .watchdog_policy import (
+    ACTIVE_ENERGY_MAX_AGE_SECONDS,
+    CAPPED_REASONS,
     ESCALATE_AFTER_SECONDS,
     ESCALATE_BACKOFF_SECONDS,
     MOTION_ESCALATE_AFTER_SECONDS,
+    MOTION_ESCALATE_BACKOFF_SECONDS,
     MOTION_EVIDENCE_MAX_AGE_SECONDS,
+    PARKED_WAKE_REASONS,
+    REFUSAL_LOG_INTERVAL_SECONDS,
+    counts_for_day,
+    daily_cap_allows,
+    motion_refusal,
     should_escalate,
-    should_escalate_moving,
 )
 
 from .const import (
@@ -1263,6 +1271,124 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.error("MQTT connect error: %s", err)
         _LOGGER.warning("Will retry in background via paho reconnect")
 
+    # The escalation's clock has to outlive this setup, or "at most one wake per
+    # 12h" is only true until the next reload. Measured 2026-10-16: an options
+    # change at 22:43 rebuilt this state, and the escalation fired again at 23:13
+    # - one hour after the previous wake, not twelve. The session counters reset
+    # with the session (that is what "this session" means); the backoff clock is
+    # a promise about the car, so it is stored.
+    watchdog_store: Store = Store(
+        hass, _WATCHDOG_STORE_VERSION, f"{DOMAIN}_watchdog_{vin}"
+    )
+    try:
+        saved_watchdog: dict[str, Any] = await watchdog_store.async_load() or {}
+    except Exception:  # noqa: BLE001 - a bad store must not block setup
+        _LOGGER.warning(
+            "Could not read the watchdog store; the escalation clock starts over",
+            exc_info=True,
+        )
+        saved_watchdog = {}
+    watchdog_state: dict[str, Any] = {
+        "last_reconnect": 0.0,
+        "tick_count": 0,
+        "last_escalation": float(saved_watchdog.get("last_escalation") or 0.0),
+        "escalations": 0,
+        # The local day the counts belong to, and what was sent that day by
+        # reason. Stored with the escalation clock: a cap on wakes is a promise
+        # about the car, so it has to outlive a reload.
+        "day": dt_util.now().date().isoformat(),
+        "counts": {},
+        # When each (reason, cause) refusal was last logged.
+        "refused_at": {},
+    }
+    watchdog_state["counts"] = counts_for_day(
+        saved_watchdog.get("day"), saved_watchdog.get("counts"), watchdog_state["day"]
+    )
+
+    def _counts_today() -> dict[str, int]:
+        """Today's force-upload counts; a new local day starts at zero."""
+        today = dt_util.now().date().isoformat()
+        if watchdog_state["day"] != today:
+            watchdog_state["day"] = today
+            watchdog_state["counts"] = {}
+        return watchdog_state["counts"]
+
+    def _publish_force_upload_counts() -> None:
+        counts = _counts_today()
+        coordinator.set_poll_status(
+            force_uploads_today=sum(counts.values()),
+            parked_wakes_today=sum(counts.get(r, 0) for r in PARKED_WAKE_REASONS),
+            motion_arms_today=counts.get("motion", 0),
+        )
+
+    async def _save_watchdog_state() -> None:
+        try:
+            await watchdog_store.async_save(
+                {
+                    "last_escalation": watchdog_state["last_escalation"],
+                    "day": watchdog_state["day"],
+                    "counts": watchdog_state["counts"],
+                }
+            )
+        except Exception:  # noqa: BLE001 - never let storage stop a force-upload
+            _LOGGER.warning(
+                "Could not persist the watchdog state; the next reload may "
+                "allow an earlier wake than the 12h backoff and the daily caps "
+                "promise",
+                exc_info=True,
+            )
+
+    def _log_refusal(reason: str, cause: str, detail: str) -> None:
+        """Name why a force-upload was refused, without flooding the log.
+
+        WARNING for the first refusal of a reason and cause, then DEBUG for as
+        long as refusals keep coming less than ``REFUSAL_LOG_INTERVAL_SECONDS``
+        apart; a longer gap starts a new episode.
+        """
+        now_ts = time.time()
+        key = f"{reason}:{cause}"
+        last = watchdog_state["refused_at"].get(key, 0.0)
+        watchdog_state["refused_at"][key] = now_ts
+        log = (
+            _LOGGER.warning
+            if now_ts - last > REFUSAL_LOG_INTERVAL_SECONDS
+            else _LOGGER.debug
+        )
+        log("Force upload refused: reason=%s cause=%s (%s)", reason, cause, detail)
+
+    async def _force_upload(reason: str) -> bool:
+        """Ask the car for a full state (``cmd_type: 2``) and count it.
+
+        Every force-upload goes through here, so the counts and the daily caps
+        see all of them. The caller decides whether it is allowed; ``reason`` is
+        one of ``cold_start``, ``stall``, ``motion``, ``active`` or ``user``. A
+        publish that did not go out is logged but not counted.
+        """
+        sent = bool(
+            await hass.async_add_executor_job(
+                mqtt_client.send_command, vin, 19, {"cmd_type": 2}, 2
+            )
+        )
+        counts = _counts_today()
+        if sent:
+            counts[reason] = counts.get(reason, 0) + 1
+            coordinator.set_poll_status(
+                last_force_upload_reason=reason, last_force_upload_at=time.time()
+            )
+        _publish_force_upload_counts()
+        _LOGGER.info(
+            "Force upload: reason=%s sent=%s today=%s",
+            reason, sent, sum(counts.values()),
+        )
+        # `active` fires every minute of a drive and only counts: it is not
+        # worth a disk write.
+        if sent and reason in CAPPED_REASONS:
+            await _save_watchdog_state()
+        return sent
+
+    coordinator.force_upload = _force_upload
+    _publish_force_upload_counts()
+
     # 5. Initial query.
     # On a genuine HA restart (hass not yet running) we send ONE cmd_type:2
     # force-upload to wake the car, so every boot captures a full state snapshot
@@ -1272,20 +1398,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # state query (msg_type=4), which a sleeping car answers with a ~248-byte
     # stub without waking. The periodic timer and watchdog never wake the car.
     query_timer_state: dict[str, float] = {"last_sent": time.time()}
-    if not hass.is_running and coordinator.command_policy.can_wake():
-        _LOGGER.info("Cold start — one force-upload to wake the car for a full snapshot")
-        await hass.async_add_executor_job(
-            mqtt_client.send_command, vin, 19, {"cmd_type": 2}, 2
-        )
-    elif not hass.is_running:
-        # Cold start with waking switched off (command permissions ->
-        # "allow wake"): a passive query still refreshes what the car will
-        # answer while asleep, it just will not produce a full snapshot.
-        _LOGGER.info(
-            "Cold start — waking is disabled by this integration's command "
-            "permissions, sending a passive query instead"
-        )
-        await hass.async_add_executor_job(mqtt_client.send_query, vin)
+    if not hass.is_running:
+        if not coordinator.command_policy.can_wake():
+            # Cold start with waking switched off (command permissions ->
+            # "allow wake"): a passive query still refreshes what the car will
+            # answer while asleep, it just will not produce a full snapshot.
+            _log_refusal(
+                "cold_start", "can_wake",
+                "waking is disabled by the command permissions; sending a "
+                "passive query instead",
+            )
+            await hass.async_add_executor_job(mqtt_client.send_query, vin)
+        elif not daily_cap_allows("cold_start", _counts_today()):
+            _log_refusal(
+                "cold_start", "cap",
+                "the parked-car wakes of today are spent; sending a passive "
+                "query instead",
+            )
+            await hass.async_add_executor_job(mqtt_client.send_query, vin)
+        else:
+            _LOGGER.info("Cold start - one force-upload to wake the car for a full snapshot")
+            await _force_upload("cold_start")
     else:
         _LOGGER.info("Reload while running — passive query only, not waking the car")
         await hass.async_add_executor_job(mqtt_client.send_query, vin)
@@ -1307,6 +1440,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def _send_periodic_query(_now: Any) -> None:
         now = time.time()
         active = coordinator.is_charging or coordinator.vehicle_parked is False
+        # A lost final P or unplug frame must not leave a minute-by-minute
+        # force-upload loop running on a parked car: without recent energy
+        # data, `active` falls back to passive.
+        energy_age = coordinator.energy_data_age_seconds()
+        force = active and energy_age < ACTIVE_ENERGY_MAX_AGE_SECONDS
         # An external charging hint raises the cadence but NOT the kind of query:
         # `active` alone decides whether we may force-upload, because that is the
         # only thing here that can wake a car, and the hint is someone else's word
@@ -1327,25 +1465,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         query_timer_state["last_sent"] = now
         _LOGGER.debug(
             "Periodic query: kind=%s interval=%.0fs parked=%s charging=%s "
-            "charging_hint=%s",
-            "force_upload" if active else "passive",
+            "charging_hint=%s energy_age=%.0fs",
+            "force_upload" if force else "passive",
             min_gap,
             coordinator.vehicle_parked,
             coordinator.is_charging,
             hint,
+            energy_age,
         )
         try:
-            if active:
-                await hass.async_add_executor_job(
-                    mqtt_client.send_command, vin, 19, {"cmd_type": 2}, 2
-                )
+            if force:
+                await _force_upload("active")
             else:
                 await hass.async_add_executor_job(mqtt_client.send_query, vin)
         except Exception:
             _LOGGER.debug("Periodic MQTT query failed", exc_info=True)
         coordinator.set_poll_status(
             last_query_at=now,
-            last_query_kind="force_upload" if active else "passive",
+            last_query_kind="force_upload" if force else "passive",
         )
 
     cancel_timer = async_track_time_interval(
@@ -1746,29 +1883,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # never wake the car — so it is NOT gated on parked/charging state.
     # "Don't wake the car" is enforced by the no-scheduled-cmd_type:2 rule and
     # the adaptive query cadence above, not here.
-    # The escalation's clock has to outlive this setup, or "at most one wake per
-    # 12h" is only true until the next reload. Measured 2026-10-16: an options
-    # change at 22:43 rebuilt this state, and the escalation fired again at 23:13
-    # — one hour after the previous wake, not twelve. The session counters reset
-    # with the session (that is what "this session" means); the backoff clock is
-    # a promise about the car, so it is stored.
-    watchdog_store: Store = Store(
-        hass, _WATCHDOG_STORE_VERSION, f"{DOMAIN}_watchdog_{vin}"
-    )
-    try:
-        saved_watchdog: dict[str, Any] = await watchdog_store.async_load() or {}
-    except Exception:  # noqa: BLE001 - a bad store must not block setup
-        _LOGGER.warning(
-            "Could not read the watchdog store; the escalation clock starts over",
-            exc_info=True,
-        )
-        saved_watchdog = {}
-    watchdog_state: dict[str, float] = {
-        "last_reconnect": 0.0,
-        "tick_count": 0,
-        "last_escalation": float(saved_watchdog.get("last_escalation") or 0.0),
-        "escalations": 0,
-    }
     SILENCE_THRESHOLD = 300  # silence this long with socket up → suspect stuck
     RECONNECT_BACKOFF = 600  # active/charging: the car is awake, reconnects are cheap
     # Parked, a reconnect is close to pointless and not free: the car answers a
@@ -1805,18 +1919,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # that budget while driving, and 46 minutes of frozen telemetry. See
         # watchdog_policy.should_escalate_moving.
         motion_evidence_at = coordinator.last_motion_at
-        motion_escalation = should_escalate_moving(
+        refusal = motion_refusal(
             coordinator.energy_data_age_seconds(),
             last_escalation,
             now_ts,
             motion_evidence_at,
             escalate_after=MOTION_ESCALATE_AFTER_SECONDS,
         )
+        motion_escalation = refusal is None
+        counts = _counts_today()
+        if refusal == "backoff":
+            _log_refusal(
+                "motion", "backoff",
+                f"{now_ts - last_escalation:.0f}s since the last force-upload, "
+                f"one per {MOTION_ESCALATE_BACKOFF_SECONDS:.0f}s",
+            )
         if motion_escalation and coordinator.external_charging_hint:
             # A charger said current is flowing. Only that vetoes: a stale
             # is_charging cannot, because a rising odometer is physical motion.
-            _LOGGER.debug("Motion arm (%s) vetoed by the external charging hint", trigger)
+            _log_refusal("motion", "hint", "an external charging hint is active")
             motion_escalation = False
+        if motion_escalation and not daily_cap_allows("motion", counts):
+            _log_refusal(
+                "motion", "cap", f"{counts.get('motion', 0)} motion arms today"
+            )
+            motion_escalation = False
+        if (
+            pending_escalation
+            and not motion_escalation
+            and not daily_cap_allows("stall", counts)
+        ):
+            _log_refusal(
+                "stall", "cap",
+                f"{sum(counts.get(r, 0) for r in PARKED_WAKE_REASONS)} "
+                "parked-car wakes today",
+            )
+            pending_escalation = False
         if motion_escalation and not pending_escalation and not mqtt_client.connected:
             # A publish that cannot go out must not spend the arm. The tick
             # retries once the client is connected again.
@@ -1851,14 +1989,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # bound the wake, so the clock must not depend on the publish succeeding
         # (a refused client is exactly when a wake attempt is most likely to be
         # spent and least likely to have done anything).
-        try:
-            await watchdog_store.async_save({"last_escalation": now_ts})
-        except Exception:  # noqa: BLE001 - never let storage stop the escalation
-            _LOGGER.warning(
-                "Could not persist the watchdog escalation clock; the next "
-                "reload may allow an earlier wake than the 12h backoff promises",
-                exc_info=True,
-            )
+        await _save_watchdog_state()
+        reason = "motion" if motion_escalation else "stall"
         try:
             if coordinator.command_policy.can_wake():
                 if motion_escalation:
@@ -1880,37 +2012,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         "motion evidence)",
                         stale / 60, silence, ESCALATE_BACKOFF_SECONDS / 3600,
                     )
-                await hass.async_add_executor_job(
-                    mqtt_client.send_command, vin, 19, {"cmd_type": 2}, 2
-                )
+                await _force_upload(reason)
             else:
                 # Escalation exists to wake a sleeping car. With waking
                 # switched off, the passive query is the most this may do - it
                 # is still worth sending, because a car that is awake answers
                 # it, and that is the case the escalation is usually meeting.
-                if motion_escalation:
-                    # Once per episode: refusals come at least one backoff
-                    # apart, so a gap longer than the evidence lifetime means a
-                    # new episode.
-                    last_refused = watchdog_state.get("motion_refused_at", 0.0)
-                    watchdog_state["motion_refused_at"] = now_ts
-                    log_refusal = (
-                        _LOGGER.warning
-                        if now_ts - last_refused > MOTION_EVIDENCE_MAX_AGE_SECONDS
-                        else _LOGGER.debug
-                    )
-                    log_refusal(
-                        "Motion arm (%s) refused: waking is disabled by the "
-                        "command permissions - sending a passive query "
-                        "instead, the car may stay silent",
-                        trigger,
-                    )
-                else:
-                    _LOGGER.info(
-                        "Watchdog: %.0fmin without fresh vehicle data (state topic "
-                        "quiet %.0fs); waking is disabled - sending a passive query",
-                        stale / 60, silence,
-                    )
+                _log_refusal(
+                    reason, "can_wake",
+                    "waking is disabled by the command permissions; sending a "
+                    "passive query instead",
+                )
                 await hass.async_add_executor_job(mqtt_client.send_query, vin)
         except Exception:
             _LOGGER.exception("Watchdog escalation force-upload failed")

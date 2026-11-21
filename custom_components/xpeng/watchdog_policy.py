@@ -56,6 +56,8 @@ they cannot work.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 #: Unbroken silence before a force-upload is allowed. Half an hour: several
 #: reconnect cycles' worth, so a connection that merely needed a nudge has had
 #: its chance, and short enough that a stalled start-of-drive is noticed while
@@ -139,14 +141,90 @@ def should_escalate_moving(
     or said nothing about driving; both mean "do not spend the sleeping car's
     allowance on this".
     """
+    return (
+        motion_refusal(
+            silence_seconds,
+            last_escalation,
+            now,
+            last_motion_at,
+            escalate_after,
+            motion_backoff,
+            motion_max_age,
+        )
+        is None
+    )
+
+
+def motion_refusal(
+    silence_seconds: float,
+    last_escalation: float,
+    now: float,
+    last_motion_at: float,
+    escalate_after: float = ESCALATE_AFTER_SECONDS,
+    motion_backoff: float = MOTION_ESCALATE_BACKOFF_SECONDS,
+    motion_max_age: float = MOTION_EVIDENCE_MAX_AGE_SECONDS,
+) -> str | None:
+    """Why ``should_escalate_moving`` says no, or None when it says yes.
+
+    One of ``patience``, ``no_evidence``, ``stale_evidence``, ``backoff`` or
+    ``spent`` (the evidence is not newer than the last escalation). Only
+    ``backoff`` is a refusal of an arm that is otherwise due: the others are the
+    ordinary state of a car that is parked, or whose stream is healthy.
+    """
     if silence_seconds < escalate_after:
-        return False
+        return "patience"
     if not last_motion_at:
-        return False
+        return "no_evidence"
     if now - last_motion_at > motion_max_age:
-        return False
+        return "stale_evidence"
     if last_escalation and (now - last_escalation) < motion_backoff:
-        return False
+        return "backoff"
     if last_escalation and last_motion_at <= last_escalation:
-        return False
+        return "spent"
+    return None
+
+
+#: Why a force-upload is sent. The parked class can wake a sleeping car, so it
+#: has a daily cap; motion arms go to a car that is already awake and have a
+#: higher one; the other two are only counted.
+PARKED_WAKE_REASONS: tuple[str, ...] = ("cold_start", "stall")
+PARKED_WAKES_PER_DAY: int = 2
+MOTION_ARMS_PER_DAY: int = 24
+
+#: The reasons with a cap; their counts are stored, the others are not.
+CAPPED_REASONS: tuple[str, ...] = (*PARKED_WAKE_REASONS, "motion")
+
+#: ``active`` force-uploads (every scan interval while charging or driving) need
+#: energy data this recent. A lost final P or unplug frame would otherwise leave
+#: a one-minute force-upload loop running on a parked car.
+ACTIVE_ENERGY_MAX_AGE_SECONDS: float = 15 * 60
+
+#: A refusal is logged at WARNING at most this often per reason and cause.
+REFUSAL_LOG_INTERVAL_SECONDS: float = 10 * 60
+
+
+def daily_cap_allows(reason: str, counts: Mapping[str, int]) -> bool:
+    """Whether today's counts leave room for another force-upload of ``reason``.
+
+    The parked class shares one allowance, so a cold start spends one of the two
+    wakes a stall could use. Motion arms have their own and never spend it.
+    ``active`` and ``user`` are counted only.
+    """
+    if reason in PARKED_WAKE_REASONS:
+        return sum(counts.get(r, 0) for r in PARKED_WAKE_REASONS) < PARKED_WAKES_PER_DAY
+    if reason == "motion":
+        return counts.get("motion", 0) < MOTION_ARMS_PER_DAY
     return True
+
+
+def counts_for_day(
+    saved_day: str | None, saved_counts: Mapping[str, int] | None, today: str
+) -> dict[str, int]:
+    """The stored counts if they are from ``today`` (the local day), else none.
+
+    A store written before the counts existed has neither key, and starts the
+    day at zero.
+    """
+    if saved_day != today or not isinstance(saved_counts, Mapping):
+        return {}
+    return {str(k): int(v) for k, v in saved_counts.items()}

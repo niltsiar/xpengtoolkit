@@ -211,11 +211,12 @@ class TestTheEscalationIsReachable(unittest.TestCase):
             node.name: ast.unparse(node)
             for node in ast.walk(tree)
             if isinstance(node, ast.AsyncFunctionDef)
-            and node.name in ("_silence_watchdog", "_motion_arm")
+            and node.name in ("_silence_watchdog", "_motion_arm", "_force_upload")
         }
         tick, arm = nodes["_silence_watchdog"], nodes["_motion_arm"]
         self.assertIn("sending ONE", arm, "the force-upload escalation is gone")
-        self.assertIn("send_command", arm, "the escalation no longer sends")
+        self.assertIn("_force_upload(reason)", arm, "the escalation no longer sends")
+        self.assertIn("send_command", nodes["_force_upload"])
         self.assertIn("_motion_arm('watchdog')", tick, "the tick no longer escalates")
         self.assertLess(
             tick.index("if silence < SILENCE_THRESHOLD"),
@@ -244,11 +245,28 @@ class TestTheBackoffSurvivesAReload(unittest.TestCase):
         )
 
     def test_the_clock_is_written_where_it_is_spent(self):
-        self.assertIn('await watchdog_store.async_save({"last_escalation": now_ts})', self.SOURCE)
+        save = next(
+            node
+            for node in ast.walk(ast.parse(self.SOURCE))
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_save_watchdog_state"
+        )
+        shapes = [
+            sorted(k.value for k in node.keys)
+            for node in ast.walk(save)
+            if isinstance(node, ast.Dict)
+        ]
+        self.assertEqual(shapes, [["counts", "day", "last_escalation"]])
+        arm = self.SOURCE[self.SOURCE.index("async def _motion_arm(") :]
         self.assertLess(
-            self.SOURCE.index('watchdog_state["last_escalation"] = now_ts'),
-            self.SOURCE.index("await watchdog_store.async_save("),
+            arm.index('watchdog_state["last_escalation"] = now_ts'),
+            arm.index("await _save_watchdog_state()"),
             "the clock must be stored where the wake is sent, not later",
+        )
+        self.assertLess(
+            arm.index("await _save_watchdog_state()"),
+            arm.index("await _force_upload(reason)"),
+            "the clock must be stored before the send, not after it",
         )
 
     def test_a_broken_store_does_not_block_setup(self):
@@ -398,11 +416,53 @@ class TestMotionEscalation(unittest.TestCase):
             )
         )
 
+    def test_a_third_parked_wake_in_a_day_is_refused(self):
+        for counts, expected in (
+            ({}, True),
+            ({"cold_start": 1}, True),
+            ({"cold_start": 1, "stall": 1}, False),
+            ({"stall": 2}, False),
+        ):
+            with self.subTest(counts=counts):
+                self.assertEqual(policy.daily_cap_allows("stall", counts), expected)
+                self.assertEqual(policy.daily_cap_allows("cold_start", counts), expected)
+
+    def test_motion_arms_do_not_spend_the_parked_cap(self):
+        self.assertTrue(policy.daily_cap_allows("stall", {"motion": 23}))
+        self.assertTrue(policy.daily_cap_allows("cold_start", {"motion": 24}))
+        self.assertTrue(policy.daily_cap_allows("motion", {"stall": 2, "cold_start": 2}))
+
+    def test_motion_arms_stop_at_the_daily_cap(self):
+        self.assertTrue(policy.daily_cap_allows("motion", {"motion": 23}))
+        self.assertFalse(policy.daily_cap_allows("motion", {"motion": 24}))
+
+    def test_active_and_user_force_uploads_are_only_counted(self):
+        for reason in ("active", "user"):
+            self.assertTrue(policy.daily_cap_allows(reason, {reason: 1000, "stall": 2, "motion": 24}))
+
+    def test_the_counter_resets_at_local_midnight(self):
+        stored = {"stall": 2, "motion": 3}
+        self.assertEqual(policy.counts_for_day("2026-11-21", stored, "2026-11-21"), stored)
+        self.assertEqual(policy.counts_for_day("2026-11-21", stored, "2026-11-22"), {})
+
+    def test_a_store_from_before_the_counts_starts_the_day_at_zero(self):
+        self.assertEqual(policy.counts_for_day(None, None, "2026-11-21"), {})
+
+    def test_only_a_backoff_is_a_refusal_of_an_arm_that_is_due(self):
+        now = 100_000.0
+        kwargs = dict(escalate_after=policy.MOTION_ESCALATE_AFTER_SECONDS)
+        self.assertEqual(policy.motion_refusal(60, 0.0, now, now - 30, **kwargs), "patience")
+        self.assertEqual(policy.motion_refusal(300, 0.0, now, 0.0, **kwargs), "no_evidence")
+        self.assertEqual(policy.motion_refusal(300, 0.0, now, now - 700, **kwargs), "stale_evidence")
+        self.assertEqual(policy.motion_refusal(300, now - 100, now, now - 30, **kwargs), "backoff")
+        self.assertEqual(policy.motion_refusal(300, now - 400, now, now - 500, **kwargs), "spent")
+        self.assertIsNone(policy.motion_refusal(300, now - 400, now, now - 30, **kwargs))
+
     def test_the_watchdog_asks_both_questions(self):
         """Pinned at the call site: the sleeping-car rule is never replaced."""
         source = (_component.component_dir() / "__init__.py").read_text(encoding="utf-8")
         self.assertIn("should_escalate(", source)
-        self.assertIn("should_escalate_moving(", source)
+        self.assertIn("motion_refusal(", source)
         self.assertIn(
             "escalation_allowed = pending_escalation or motion_escalation", source
         )

@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -124,19 +124,38 @@ class IdentityIOTests(unittest.IsolatedAsyncioTestCase):
                             for node in ast.walk(setup)))
 
 
-class WatchdogDiagnosticTests(unittest.IsolatedAsyncioTestCase):
+ARM_FUNCTIONS = ("_motion_arm", "_force_upload", "_counts_today",
+                 "_publish_force_upload_counts", "_save_watchdog_state", "_log_refusal")
+POLICY_NAMES = (
+    "ESCALATE_AFTER_SECONDS", "ESCALATE_BACKOFF_SECONDS", "MOTION_ESCALATE_AFTER_SECONDS",
+    "MOTION_ESCALATE_BACKOFF_SECONDS", "MOTION_EVIDENCE_MAX_AGE_SECONDS",
+    "PARKED_WAKE_REASONS", "CAPPED_REASONS", "REFUSAL_LOG_INTERVAL_SECONDS",
+    "should_escalate", "motion_refusal", "daily_cap_allows",
+)
+
+
+def watchdog_policy():
+    spec = importlib.util.spec_from_file_location("watchdog_test_policy", _component.module_path("watchdog_policy.py"))
+    policy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy)
+    return policy
+
+
+def local_day(timestamp):
+    return datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+
+
+class WatchdogHarness(unittest.IsolatedAsyncioTestCase):
     NOW = 100_000.0
 
     def build(self, *, parked=True, charging=False, connected=True, stale=350,
               motion_age=None, can_wake=True, park_during_save=False,
-              energy_age=None, hint=False, last_reconnect_age=None):
+              energy_age=None, hint=False, last_reconnect_age=None, counts=None):
         """The real tick and arm closures, with a car and a clock around them."""
         clock = {"now": self.NOW}
         calls = []
-        ns = functions("_motion_arm", "_silence_watchdog")
-        spec = importlib.util.spec_from_file_location("watchdog_test_policy", _component.module_path("watchdog_policy.py"))
-        policy = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(policy)
+        ns = functions("_silence_watchdog", *ARM_FUNCTIONS)
+        policy = watchdog_policy()
         async def executor(fn, *args):
             return fn(*args)
         async def save(data):
@@ -144,6 +163,8 @@ class WatchdogDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             if park_during_save:
                 ns["coordinator"].last_motion_at = 0.0
+        poll = {}
+        self.poll = poll
         evidence_at = self.NOW - motion_age if motion_age is not None else 0.0
         coordinator = SimpleNamespace(vehicle_parked=parked, is_charging=charging,
             last_motion_at=evidence_at, last_motion_arm_at=0.0,
@@ -151,26 +172,25 @@ class WatchdogDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             energy_data_age_seconds=lambda: stale if energy_age is None else energy_age,
             motion_evidence_fresh=lambda max_age: bool(coordinator.last_motion_at)
             and clock["now"] - coordinator.last_motion_at <= max_age,
-            command_policy=SimpleNamespace(can_wake=lambda: can_wake), set_poll_status=lambda **kwargs: None)
+            command_policy=SimpleNamespace(can_wake=lambda: can_wake),
+            set_poll_status=lambda **kwargs: poll.update(kwargs))
         ns.update(
             time=SimpleNamespace(time=lambda: clock["now"]), vin="TESTVIN", entry=object(),
             refresh_state={},
             watchdog_state={"tick_count": 0,
                 "last_reconnect": self.NOW - last_reconnect_age if last_reconnect_age is not None else 0.0,
-                "last_escalation": 0.0, "escalations": 0},
+                "last_escalation": 0.0, "escalations": 0,
+                "day": local_day(self.NOW), "counts": dict(counts or {}), "refused_at": {}},
+            dt_util=SimpleNamespace(now=lambda: datetime.fromtimestamp(clock["now"], timezone.utc)),
             SILENCE_THRESHOLD=300, RECONNECT_BACKOFF=600, PARKED_RECONNECT_BACKOFF=1800,
-            ESCALATE_AFTER_SECONDS=policy.ESCALATE_AFTER_SECONDS,
-            ESCALATE_BACKOFF_SECONDS=policy.ESCALATE_BACKOFF_SECONDS,
-            MOTION_ESCALATE_AFTER_SECONDS=policy.MOTION_ESCALATE_AFTER_SECONDS,
-            MOTION_EVIDENCE_MAX_AGE_SECONDS=policy.MOTION_EVIDENCE_MAX_AGE_SECONDS,
-            should_escalate=policy.should_escalate, should_escalate_moving=policy.should_escalate_moving,
+            **{name: getattr(policy, name) for name in POLICY_NAMES},
             poll_status=SimpleNamespace(is_escalated=lambda *args, **kwargs: False),
             coordinator=coordinator,
             mqtt_client=SimpleNamespace(connected=connected, last_state_msg_ts=self.NOW - 350,
                 last_msg_ts=self.NOW - 350, last_meaningful_state_ts=self.NOW - stale,
                 reconnect=lambda *args: calls.append(("reconnect",)) or True,
                 send_query=lambda *args: calls.append(("query",)),
-                send_command=lambda *args: calls.append(("command", *args))),
+                send_command=lambda *args: calls.append(("command", *args)) or True),
             hass=SimpleNamespace(async_add_executor_job=executor), watchdog_store=SimpleNamespace(async_save=save),
             _refresh_creds_sync=lambda *args: None,
         )
@@ -183,6 +203,8 @@ class WatchdogDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(r.levelno >= logging.ERROR for r in logs.records))
         return logs.records, calls
 
+
+class WatchdogDiagnosticTests(WatchdogHarness):
     async def test_known_parked_reconnect_is_info_and_still_queries(self):
         logs, calls = await self.tick()
         recovery = [r for r in logs if "reconnecting" in r.getMessage()]
@@ -243,8 +265,9 @@ class WatchdogDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("reconnect",), driving_calls)
 
     async def test_charging_hint_vetoes_motion_arming(self):
-        _, calls = await self.tick(stale=200, motion_age=30, hint=True)
+        logs, calls = await self.tick(stale=200, motion_age=30, hint=True)
         self.assertFalse(any(c[0] == "command" for c in calls))
+        self.assertIn("cause=hint", " ".join(r.getMessage() for r in logs if r.levelno == logging.WARNING))
         _, calls = await self.tick(stale=200, motion_age=30, hint=False)
         self.assertTrue(any(c[0] == "command" for c in calls))
 
@@ -261,13 +284,141 @@ class WatchdogDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             await ns["_motion_arm"]("watchdog")
         warnings = [r for r in logs.records if r.levelno == logging.WARNING]
         self.assertEqual(len(warnings), 1, "one WARNING for the whole episode")
-        self.assertIn("refused", warnings[0].getMessage())
+        self.assertIn("cause=can_wake", warnings[0].getMessage())
         self.assertFalse(any(c[0] == "command" for c in calls))
         self.assertEqual(sum(c[0] == "query" for c in calls), 2)
         with self.assertLogs("xpeng.test", level="WARNING"):
             clock["now"] += 11 * 60
             ns["coordinator"].last_motion_at = clock["now"] - 30
             await ns["_motion_arm"]("widget")
+
+
+class TheForceUploadsAreCountedAndCapped(WatchdogHarness):
+    """Every force-upload goes through one sender; the parked class and motion are capped."""
+
+    async def test_each_force_upload_is_counted_with_its_reason(self):
+        ns, calls, _ = self.build()
+        with self.assertLogs("xpeng.test", level="INFO") as logs:
+            for reason in ("cold_start", "motion", "active", "active", "user"):
+                self.assertTrue(await ns["_force_upload"](reason))
+        self.assertEqual(ns["watchdog_state"]["counts"], {"cold_start": 1, "motion": 1, "active": 2, "user": 1})
+        self.assertEqual(
+            {k: self.poll[k] for k in ("force_uploads_today", "parked_wakes_today", "motion_arms_today", "last_force_upload_reason")},
+            {"force_uploads_today": 5, "parked_wakes_today": 1, "motion_arms_today": 1, "last_force_upload_reason": "user"},
+        )
+        self.assertIn("Force upload: reason=motion sent=True today=2", [r.getMessage() for r in logs.records])
+        saves = [c[1] for c in calls if c[0] == "save"]
+        self.assertEqual(len(saves), 2, "only the capped reasons are written to the store")
+        self.assertEqual(sorted(saves[-1]), ["counts", "day", "last_escalation"])
+
+    async def test_a_publish_that_did_not_go_out_is_not_counted(self):
+        ns, calls, _ = self.build()
+        ns["mqtt_client"].send_command = lambda *args: False
+        with self.assertLogs("xpeng.test", level="INFO") as logs:
+            self.assertFalse(await ns["_force_upload"]("stall"))
+        self.assertEqual(ns["watchdog_state"]["counts"], {})
+        self.assertIn("Force upload: reason=stall sent=False today=0", [r.getMessage() for r in logs.records])
+
+    async def test_the_counts_start_over_at_local_midnight(self):
+        ns, _, clock = self.build(counts={"stall": 2})
+        ns["dt_util"] = SimpleNamespace(
+            now=lambda: datetime.fromtimestamp(clock["now"], timezone(timedelta(hours=11)))
+        )
+        ns["watchdog_state"]["day"] = ns["dt_util"].now().date().isoformat()
+        self.assertEqual(ns["_counts_today"](), {"stall": 2})
+        clock["now"] += 3600 * 24
+        self.assertEqual(ns["_counts_today"](), {})
+        self.assertEqual(ns["watchdog_state"]["day"], ns["dt_util"].now().date().isoformat())
+
+    async def test_a_stall_past_the_parked_cap_is_refused_and_names_the_cause(self):
+        logs, calls = await self.tick(stale=1860, counts={"cold_start": 1, "stall": 1})
+        self.assertFalse(any(c[0] == "command" for c in calls))
+        causes = [r.getMessage() for r in logs if r.levelno == logging.WARNING]
+        self.assertTrue(any("reason=stall cause=cap" in m for m in causes), causes)
+
+    async def test_a_motion_arm_past_the_daily_cap_is_refused_and_names_the_cause(self):
+        logs, calls = await self.tick(stale=200, motion_age=30, counts={"motion": 24})
+        self.assertFalse(any(c[0] == "command" for c in calls))
+        causes = [r.getMessage() for r in logs if r.levelno == logging.WARNING]
+        self.assertTrue(any("reason=motion cause=cap" in m for m in causes), causes)
+
+    async def test_motion_arms_do_not_spend_the_parked_cap(self):
+        ns, _, _ = self.build(stale=200, motion_age=30, counts={"motion": 23})
+        with self.assertLogs("xpeng.test", level="INFO"):
+            self.assertTrue(await ns["_motion_arm"]("widget"))
+        self.assertEqual(ns["watchdog_state"]["counts"], {"motion": 24})
+        self.assertTrue(ns["daily_cap_allows"]("stall", ns["watchdog_state"]["counts"]))
+
+    async def test_a_backoff_refusal_names_the_cause_once(self):
+        ns, _, clock = self.build(stale=200, motion_age=30)
+        ns["watchdog_state"]["last_escalation"] = self.NOW - 100
+        with self.assertLogs("xpeng.test", level="DEBUG") as logs:
+            self.assertFalse(await ns["_motion_arm"]("widget"))
+            clock["now"] += 30
+            ns["coordinator"].last_motion_at = clock["now"] - 10
+            self.assertFalse(await ns["_motion_arm"]("widget"))
+        warnings = [r.getMessage() for r in logs.records if r.levelno == logging.WARNING]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("cause=backoff", warnings[0])
+
+    def test_the_cold_start_is_counted_and_capped_after_the_store_loads(self):
+        setup = SOURCE[SOURCE.index("async def async_setup_entry"):]
+        self.assertLess(setup.index("await watchdog_store.async_load()"), setup.index("# 5. Initial query."))
+        self.assertEqual(setup.count("await watchdog_store.async_load()"), 1)
+        cold = setup[setup.index("# 5. Initial query."):setup.index("# 6. Periodic MQTT query")]
+        self.assertIn('daily_cap_allows("cold_start", _counts_today())', cold)
+        self.assertIn('await _force_upload("cold_start")', cold)
+        self.assertNotIn("send_command", cold)
+
+    def test_the_button_the_switch_and_the_lock_count_as_user(self):
+        for name in ("button.py", "switch.py", "lock.py"):
+            with self.subTest(module=name):
+                text = (_component.component_dir() / name).read_text(encoding="utf-8")
+                self.assertIn('self.coordinator.force_upload("user")', text)
+                self.assertNotIn('{"cmd_type": 2}, 2', text)
+        self.assertIn("coordinator.force_upload = _force_upload", SOURCE)
+
+    def test_no_other_site_sends_the_force_upload(self):
+        self.assertEqual(SOURCE.count('{"cmd_type": 2}, 2'), 1)
+
+    def test_the_polling_status_exposes_the_counts_and_the_evidence(self):
+        sensor = (_component.component_dir() / "sensor.py").read_text(encoding="utf-8")
+        start = sensor.index("class XPengPollingStatusSensor")
+        block = sensor[start:sensor.index("class XPengNextPollSensor", start)]
+        for key in ("force_uploads_today", "parked_wakes_today", "motion_arms_today",
+                    "last_force_upload_reason", "last_force_upload_at",
+                    "last_motion_evidence_at", "last_motion_evidence"):
+            self.assertIn(f'attrs["{key}"]', block)
+
+    async def test_active_force_uploads_stop_after_fifteen_minutes_without_data(self):
+        for energy_age, kind in ((899, "command"), (901, "query")):
+            with self.subTest(energy_age=energy_age):
+                calls = []
+                ns = functions("_send_periodic_query")
+
+                async def executor(fn, *args):
+                    return fn(*args)
+
+                async def force(reason):
+                    calls.append(("command", reason))
+                    return True
+
+                ns.update(
+                    time=SimpleNamespace(time=lambda: self.NOW), vin="TESTVIN",
+                    coordinator=SimpleNamespace(
+                        is_charging=True, vehicle_parked=False, external_charging_hint=False,
+                        energy_data_age_seconds=lambda: energy_age, set_poll_status=lambda **kw: None),
+                    poll_status=SimpleNamespace(query_interval_seconds=lambda *a: 60.0),
+                    scan_interval=60, parked_scan_interval=3600,
+                    query_timer_state={"last_sent": 0.0},
+                    hass=SimpleNamespace(async_add_executor_job=executor),
+                    mqtt_client=SimpleNamespace(send_query=lambda *a: calls.append(("query",))),
+                    _force_upload=force,
+                    ACTIVE_ENERGY_MAX_AGE_SECONDS=watchdog_policy().ACTIVE_ENERGY_MAX_AGE_SECONDS,
+                )
+                with self.assertLogs("xpeng.test", level="DEBUG"):
+                    await ns["_send_periodic_query"](None)
+                self.assertEqual(calls[0][0], kind)
 
 
 class TheTripOf20261121(unittest.IsolatedAsyncioTestCase):
@@ -310,13 +461,10 @@ class TheTripOf20261121(unittest.IsolatedAsyncioTestCase):
             connected=True, last_state_msg_ts=0.0, last_msg_ts=0.0,
             last_meaningful_state_ts=0.0,
             reconnect=lambda *args: True, send_query=lambda *args: None,
-            send_command=lambda *args: calls.append(clock["now"]),
+            send_command=lambda *args: calls.append(clock["now"]) or True,
         )
         widgets = []
-        spec = importlib.util.spec_from_file_location(
-            "trip_policy", _component.module_path("watchdog_policy.py"))
-        policy = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(policy)
+        policy = watchdog_policy()
 
         async def executor(fn, *args):
             return fn(*args)
@@ -324,11 +472,13 @@ class TheTripOf20261121(unittest.IsolatedAsyncioTestCase):
         async def save(data):
             await asyncio.sleep(0)
 
-        ns = functions("_motion_arm", "_silence_watchdog", "_poll_widget_fallback")
+        ns = functions("_silence_watchdog", "_poll_widget_fallback", *ARM_FUNCTIONS)
         ns.update(
             time=SimpleNamespace(time=lambda: clock["now"]), vin="TESTVIN", entry=object(),
             refresh_state={}, coordinator=coord, mqtt_client=mqtt,
-            watchdog_state={"tick_count": 0, "last_reconnect": 0.0, "last_escalation": 0.0, "escalations": 0},
+            watchdog_state={"tick_count": 0, "last_reconnect": 0.0, "last_escalation": 0.0,
+                "escalations": 0, "day": local_day(clock["now"]), "counts": {}, "refused_at": {}},
+            dt_util=SimpleNamespace(now=lambda: datetime.fromtimestamp(clock["now"], timezone.utc)),
             SILENCE_THRESHOLD=300, RECONNECT_BACKOFF=600, PARKED_RECONNECT_BACKOFF=1800,
             hass=SimpleNamespace(async_add_executor_job=executor),
             watchdog_store=SimpleNamespace(async_save=save),
@@ -340,10 +490,7 @@ class TheTripOf20261121(unittest.IsolatedAsyncioTestCase):
             _fetch_widget_state_sync=lambda *args: widgets.pop(0),
             is_token_expired_response=lambda data: False,
             WIDGET_FAST_POLL_SECONDS=60,
-            **{name: getattr(policy, name) for name in (
-                "ESCALATE_AFTER_SECONDS", "ESCALATE_BACKOFF_SECONDS",
-                "MOTION_ESCALATE_AFTER_SECONDS", "MOTION_EVIDENCE_MAX_AGE_SECONDS",
-                "should_escalate", "should_escalate_moving")},
+            **{name: getattr(policy, name) for name in POLICY_NAMES},
         )
 
         def frame(minute, second, *, own_drive=False):

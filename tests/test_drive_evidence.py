@@ -320,6 +320,18 @@ class TheRestFallbackSaysTheCarMoved(unittest.TestCase):
                 self.assertEqual(result, (False, None))
                 self.assertIn("car asleep", "\n".join(logs.output))
 
+    def test_a_rise_on_a_sleeping_car_warns_once_per_ten_minutes(self):
+        evidence._asleep_logged_at = 0.0
+        widget = {"odometer": {"total_mileage": 62301}}
+        levels = []
+        for offset in (0, 60, 700):
+            with self.assertLogs(level="DEBUG") as logs:
+                evidence.rest_motion_evidence(
+                    widget, self._held(), now=self.NOW + offset
+                )
+            levels.append(logs.records[0].levelname)
+        self.assertEqual(levels, ["WARNING", "DEBUG", "WARNING"])
+
     def test_a_drive_state_needs_no_timer(self):
         self.assertTrue(
             evidence.rest_motion_evidence(
@@ -423,7 +435,7 @@ class TheIntegrationActuallyUsesIt(unittest.TestCase):
         init = (COMPONENT / "__init__.py").read_text(encoding="utf-8")
         self.assertIn("Drive evidence: parked=%s", init)
         self.assertIn("coord_valid=%r", init)
-        self.assertIn("should_escalate_moving(", init)
+        self.assertIn("motion_refusal(", init)
         self.assertIn("coordinator.last_motion_at", init)
         self.assertIn("Periodic query: kind=%s", init)
 

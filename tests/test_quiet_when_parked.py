@@ -67,7 +67,8 @@ class TestTheHintNeverWakes(unittest.TestCase):
         body = ast.unparse(query)
         # `active` gates the wake, the hint only gates how soon we ask.
         self.assertIn("active = coordinator.is_charging or coordinator.vehicle_parked is False", body)
-        self.assertIn("if active:", body)
+        self.assertIn("force = active and energy_age < ACTIVE_ENERGY_MAX_AGE_SECONDS", body)
+        self.assertIn("if force:", body)
         self.assertNotIn("if active or hint:", body)
         self.assertNotIn("hint or active", body)
 

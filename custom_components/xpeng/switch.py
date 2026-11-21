@@ -143,9 +143,7 @@ class XPengSentinelSwitch(XPengEntity, SwitchEntity):
         )
         # Wait for car to process, then force state refresh
         await asyncio.sleep(5)
-        await self.hass.async_add_executor_job(
-            self._mqtt_client.send_command, self._vin, 19, {"cmd_type": 2}, 2,
-        )
+        await self.coordinator.force_upload("user")
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         self._guard(group=GROUP_SECURING)

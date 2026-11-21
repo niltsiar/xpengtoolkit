@@ -12,7 +12,7 @@ import logging
 import time
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
@@ -204,6 +204,14 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: evidence. A P frame right after an arm clears ``last_motion_at``, so
         #: this is what keeps the fast widget poll open through a short stop.
         self.last_motion_arm_at: float = 0.0
+        #: When the REST widget last showed motion, and what it said; for the
+        #: polling-status sensor, because ``last_motion_at`` is also moved by
+        #: frames and cleared by a P frame.
+        self.last_motion_evidence_at: float = 0.0
+        self.last_motion_evidence: str | None = None
+        #: Set by the integration to its counted force-upload sender, which the
+        #: button, switch and lock call with reason ``user``.
+        self.force_upload: Callable[[str], Awaitable[bool]] | None = None
         #: The last widget read was answered with an expired-login code while a
         #: motion episode was open; cleared by the next good read.
         self.widget_token_expired: bool = False
@@ -1022,7 +1030,8 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             widget, self._last_full_data, max_odometer=self.max_odometer
         )
         if moving:
-            self.last_motion_at = time.time()
+            self.last_motion_at = self.last_motion_evidence_at = time.time()
+            self.last_motion_evidence = motion_reason
             _LOGGER.info(
                 "REST fallback shows the car moving (%s) - arming the "
                 "bounded motion escalation",
