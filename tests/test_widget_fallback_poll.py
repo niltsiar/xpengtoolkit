@@ -28,9 +28,12 @@ import pathlib
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import _component  # noqa: E402
+from test_startup_watchdog import functions  # noqa: E402
 
 COMP = _component.component_dir()
 INIT = (COMP / "__init__.py").read_text(encoding="utf-8")
@@ -94,6 +97,120 @@ class ThePollUsesTheFallbacksOwnRules(unittest.TestCase):
         start = INIT.index("def cancel_widget_fallback_fn(")
         end = INIT.index("cancel_widget_fallback = cancel_widget_fallback_fn", start)
         self.assertIn('widget_timer_state["stopped"] = True', INIT[start:end])
+
+
+class _PollHarness(unittest.IsolatedAsyncioTestCase):
+    """The real poll closure, run against a real coordinator on a fake clock."""
+
+    NOW = 1_795_280_300.0
+
+    def setUp(self):
+        import test_energy_guard as eg
+
+        self.eg = eg
+        self.coord = eg._coordinator_with(eg._state(60))
+        self.coord.last_motion_arm_at = 0.0
+        self.coord.widget_token_expired = False
+        self.coord.vehicle_type_code = "TYPE"
+        self.coord.last_energy_data_timestamp = datetime.fromtimestamp(
+            self.NOW - 600, timezone.utc
+        )
+        self.delays, self.merged, self.arms = [], [], []
+        self.coord.set_rest_data = self.merged.append
+        self.timer = {"cancel": None, "stopped": False, "busy": False}
+        self.answers = []
+        self.clock = patch("time.time", lambda: self.NOW)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+
+    async def poll(self):
+        async def executor(fn, *args):
+            return fn(*args)
+
+        async def arm(trigger):
+            self.arms.append(trigger)
+            return True
+
+        ns = functions("_poll_widget_fallback")
+        ns.update(
+            coordinator=self.coord, hass=SimpleNamespace(async_add_executor_job=executor),
+            entry=object(), vin="TESTVIN", widget_raw_sink=None, rest_scan_interval=300,
+            widget_timer_state=self.timer, WIDGET_FAST_POLL_SECONDS=60,
+            MOTION_ESCALATE_AFTER_SECONDS=120, MOTION_EVIDENCE_MAX_AGE_SECONDS=600,
+            async_call_later=lambda hass, delay, action: self.delays.append(delay),
+            _fetch_widget_state_sync=lambda *args: self.answers.pop(0),
+            is_token_expired_response=lambda data: isinstance(data, dict)
+            and data.get("code") == 12010101,
+            _motion_arm=arm,
+        )
+        await ns["_poll_widget_fallback"](None)
+
+    async def test_motion_suspected_polls_every_60s(self):
+        self.answers = [{"odometer": {"total_mileage": 1}}] * 2
+        await self.poll()
+        self.assertEqual(self.delays, [300], "an idle car keeps the all-day cadence")
+        self.coord.last_motion_at = self.NOW - 30
+        await self.poll()
+        self.assertEqual(self.delays, [300, 60])
+
+    async def test_the_window_stays_open_after_an_arm_and_a_stop(self):
+        """The stop's P frame clears the evidence; the arm keeps the window."""
+        self.answers = [{"odometer": {"total_mileage": 1}}] * 2
+        self.coord.last_motion_at = 0.0
+        self.coord.last_motion_arm_at = self.NOW - 590
+        await self.poll()
+        self.coord.last_motion_arm_at = self.NOW - 610
+        await self.poll()
+        self.assertEqual(self.delays, [60, 300])
+
+    async def test_an_expired_answer_never_starts_the_rest_poll(self):
+        body = _poll_body()
+        for forbidden in ("_start_reauth_if_idle", "_poll_rest_data", "_refresh_creds_sync"):
+            self.assertNotIn(forbidden, body)
+        self.answers = [{"code": 12010101, "data": None}] * 2
+        await self.poll()
+        self.assertEqual(self.merged, [], "an error body is not a widget")
+        self.assertFalse(self.coord.widget_token_expired, "no episode, no fast window")
+        self.assertEqual(self.delays, [300])
+        self.coord.last_motion_arm_at = self.NOW - 60
+        await self.poll()
+        self.assertTrue(self.coord.widget_token_expired)
+        self.assertEqual(self.delays, [300, 60], "the window waits for the new tokens")
+
+    async def test_a_good_read_closes_the_expired_window(self):
+        self.coord.widget_token_expired = True
+        self.answers = [{"odometer": {"total_mileage": 1}}]
+        await self.poll()
+        self.assertFalse(self.coord.widget_token_expired)
+        self.assertEqual(self.delays, [300])
+
+    async def test_new_evidence_arms_through_the_shared_closure(self):
+        def merge(data):
+            self.merged.append(data)
+            self.coord.last_motion_at = self.NOW
+
+        self.coord.set_rest_data = merge
+        self.answers = [{"odometer": {"total_mileage": 1}}]
+        await self.poll()
+        self.assertEqual(self.arms, ["widget"])
+
+    async def test_a_token_update_triggers_an_immediate_poll(self):
+        cancelled, scheduled = [], []
+        ns = functions("_on_tokens_updated")
+        ns.update(
+            widget_timer_state={"cancel": lambda: cancelled.append(1), "stopped": False, "busy": False},
+            async_call_later=lambda hass, delay, action: scheduled.append(delay),
+            hass=object(), _poll_widget_fallback=object(),
+        )
+        await ns["_on_tokens_updated"]()
+        self.assertEqual((cancelled, scheduled), ([1], [0]), "one chain: the old timer is replaced")
+        ns["widget_timer_state"]["busy"] = True
+        await ns["_on_tokens_updated"]()
+        self.assertEqual(scheduled, [0], "a poll already running reschedules itself")
+        self.assertIn("tokens_updated_signal(entry.entry_id)", INIT)
+        self.assertIn("async_dispatcher_connect(", INIT)
+        importer = (COMP / "credential_import.py").read_text(encoding="utf-8")
+        self.assertIn("async_dispatcher_send(hass, tokens_updated_signal(entry.entry_id))", importer)
 
 
 class TheSingleReadIsCheap(unittest.TestCase):

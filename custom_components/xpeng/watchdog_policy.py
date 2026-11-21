@@ -69,10 +69,14 @@ ESCALATE_BACKOFF_SECONDS: float = 12 * 3600
 
 #: Minimum gap between two force-uploads that are justified by *motion*. The
 #: number above exists to bound how often a parked car is woken; a moving car is
-#: already awake, so its escalation only needs a cadence, not a budget. Ten
-#: minutes: faster than a drive can hide, slow enough that a wedged fanout
-#: cannot turn every watchdog tick into a force-upload.
-MOTION_ESCALATE_BACKOFF_SECONDS: float = 10 * 60
+#: already awake, so its escalation only needs a cadence, not a budget. Five
+#: minutes is the car's own upload cadence: a faster arm cannot get more out of
+#: it, and a wedged fanout cannot turn every watchdog tick into a force-upload.
+MOTION_ESCALATE_BACKOFF_SECONDS: float = 5 * 60
+
+#: Oldest motion evidence that still justifies an arm. A rise seen more than
+#: ten minutes ago says nothing about the car now.
+MOTION_EVIDENCE_MAX_AGE_SECONDS: float = 10 * 60
 
 #: Energy silence after which the fast widget poll asks for the widget. While
 #: the stream is healthy, energy frames arrive about every 60 s, so two minutes
@@ -108,6 +112,7 @@ def should_escalate_moving(
     last_motion_at: float,
     escalate_after: float = ESCALATE_AFTER_SECONDS,
     motion_backoff: float = MOTION_ESCALATE_BACKOFF_SECONDS,
+    motion_max_age: float = MOTION_EVIDENCE_MAX_AGE_SECONDS,
 ) -> bool:
     """Whether motion evidence justifies a force-upload outside the 12 h budget.
 
@@ -117,11 +122,13 @@ def should_escalate_moving(
     on a parked stall earlier that day. Telemetry stayed frozen for 46 minutes
     while the car was being driven, where a force-upload cannot wake anything.
 
-    Three bounds replace the sleeping-car budget, all of them cheap to satisfy
+    Four bounds replace the sleeping-car budget, all of them cheap to satisfy
     only when they should be:
 
     * the caller's staleness bound still applies - motion is a reason to skip the
-      12 h budget, not the 30 minute patience;
+      12 h budget, not the patience. The motion caller measures it as the age of
+      the last energy-carrying frame and passes ``MOTION_ESCALATE_AFTER_SECONDS``;
+    * the evidence must be at most ``motion_max_age`` old;
     * the motion must be *newer than the last escalation*, so one episode of
       motion buys one wake rather than one per watchdog tick, and a fanout that
       stays wedged cannot keep escalating on the same old evidence;
@@ -135,6 +142,8 @@ def should_escalate_moving(
     if silence_seconds < escalate_after:
         return False
     if not last_motion_at:
+        return False
+    if now - last_motion_at > motion_max_age:
         return False
     if last_escalation and (now - last_escalation) < motion_backoff:
         return False

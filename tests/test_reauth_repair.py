@@ -126,6 +126,7 @@ def _load_module():
         "homeassistant.const",
         "homeassistant.exceptions",
         "homeassistant.helpers",
+        "homeassistant.helpers.dispatcher",
         "homeassistant.helpers.event",
         "homeassistant.helpers.storage",
         "homeassistant.helpers.entity_platform",
@@ -607,12 +608,18 @@ class TheMintedCredentialsAreSaved(unittest.TestCase):
         )
         refresh_state = {}
         tokens = {"accessToken": "NEW"}
-        self.mod._write_minted_to_entry(
-            hass,
-            self._entry(),
-            refresh_state,
-            {"password": "P2", "clientId": "cid", "_refreshed_tokens": tokens},
-        )
+        with mock.patch.object(self.mod, "async_dispatcher_send") as send:
+            self.mod._write_minted_to_entry(
+                hass,
+                self._entry(),
+                refresh_state,
+                {"password": "P2", "clientId": "cid", "_refreshed_tokens": tokens},
+            )
+            send.assert_called_once_with(hass, "xpeng_tokens_updated_E1")
+            send.reset_mock()
+            self.mod._write_minted_to_entry(hass, self._entry(), {}, {"password": "P3"})
+            send.assert_not_called()
+        updates.pop()
         self.assertEqual(len(updates), 1)
         self.assertEqual(updates[0][self.mod.CONF_LOGIN_TOKENS], tokens)
         self.assertEqual(updates[0][self.mod.CONF_PASSWORD], "P2")
