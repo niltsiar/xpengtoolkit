@@ -127,6 +127,7 @@ def _load_module():
         "homeassistant.exceptions",
         "homeassistant.helpers",
         "homeassistant.helpers.dispatcher",
+        "homeassistant.util",
         "homeassistant.helpers.event",
         "homeassistant.helpers.storage",
         "homeassistant.helpers.entity_platform",

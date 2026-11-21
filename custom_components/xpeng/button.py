@@ -248,13 +248,18 @@ class XPengCommandButton(XPengEntity, ButtonEntity):
                 self._msg_content, self._msg_type,
             )
             return
-        sent = await self.hass.async_add_executor_job(
-            self._mqtt_client.send_command,
-            self._vin,
-            self._service_type,
-            self._msg_content,
-            self._msg_type,
-        )
+        if self._service_type == 19 and self._msg_content == {"cmd_type": 2}:
+            # The wake button is a force-upload: it goes through the counted
+            # sender so the daily counts include it.
+            sent = await self.coordinator.force_upload("user")
+        else:
+            sent = await self.hass.async_add_executor_job(
+                self._mqtt_client.send_command,
+                self._vin,
+                self._service_type,
+                self._msg_content,
+                self._msg_type,
+            )
         if not sent:
             # A press that published nothing used to look exactly like one that
             # did: the only trace was a warning in the log. Raise instead, so the

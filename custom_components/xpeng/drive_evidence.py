@@ -42,6 +42,11 @@ from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
+#: When a rise on a sleeping car was last logged at WARNING: a refusal is
+#: reported once per ten minutes, not once per widget poll.
+_asleep_logged_at: float = 0.0
+_ASLEEP_LOG_INTERVAL_SECONDS: float = 600.0
+
 #: Shift encodings seen on this platform: strings from the MQTT push and small
 #: ints from the REST widget. 3 and 4 both mean P on the measurements we have.
 PARK_SHIFT_CODES: tuple[int, ...] = (3, 4)
@@ -199,6 +204,7 @@ def rest_motion_evidence(
     inventing movement would wake a sleeping car for nothing - and a Standby
     vehicle mode is not movement, the car is parked while it waits.
     """
+    global _asleep_logged_at
     widget_odometer = _as_float(_dig(widget, ("odometer", "total_mileage")))
     held_odometer = _as_float(
         _dig(held, ("msg_content", "instant", "odometer", "total_mileage"))
@@ -217,7 +223,14 @@ def rest_motion_evidence(
                 f"{widget_odometer - baseline:g} km ahead of the held "
                 f"{baseline:g} km"
             )
-        _LOGGER.debug(
+        at = time.time() if now is None else now
+        log = (
+            _LOGGER.warning
+            if at - _asleep_logged_at > _ASLEEP_LOG_INTERVAL_SECONDS
+            else _LOGGER.debug
+        )
+        _asleep_logged_at = at
+        log(
             "Widget odometer is %g km ahead of the held %g km, but its timer is "
             "%s: car asleep, merge only",
             widget_odometer - baseline,

@@ -110,9 +110,7 @@ class XPengLock(XPengEntity, LockEntity):
             raise HomeAssistantError(COMMAND_NOT_SENT_MESSAGE)
         # Wait for car to process, then force state refresh
         await asyncio.sleep(5)
-        refreshed = await self.hass.async_add_executor_job(
-            self._mqtt_client.send_command, self._vin, 19, {"cmd_type": 2}, 2,
-        )
+        refreshed = await self.coordinator.force_upload("user")
         if not refreshed:
             _LOGGER.debug(
                 "Lock sent, but the follow-up state refresh was not: the MQTT "

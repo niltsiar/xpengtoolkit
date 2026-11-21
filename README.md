@@ -184,11 +184,12 @@ with it - otherwise a later charge-less ping re-broadcast the frozen snapshot
 and put the value back, which is what made the battery sensor flip between two
 values every `parked_scan_interval`.
 
-Since **0.6.38** that widget read also runs on its own timer: while the push
-stream is silent past that five-minute gate, only the widget is fetched every
-`rest_scan_interval`. The heavy REST poll still slows to the parked interval, but
-a car that starts driving while the fan-out is wedged is now noticed within
-minutes instead of at the next hourly poll.
+The widget read also runs on its own timer: while the push stream has carried no
+energy data for 2 minutes, only the widget is fetched every `rest_scan_interval`
+(every 60 seconds while motion is suspected, see below). Its odometer is checked for
+motion evidence at once; the merge into the held state still waits for 5 minutes
+without energy data. The heavy REST poll slows to the parked interval, but a car
+that starts driving while the fan-out is wedged is noticed within minutes.
 
 ### The car does not get woken up
 
@@ -197,12 +198,13 @@ car is doing:
 
 | Car state | What the integration sends |
 |---|---|
-| Charging, or driving | A force-upload request every `scan_interval` (default 60s). The car is already awake, so this is not a wake-up - and it is necessary, because the cloud's push fan-out stalls often enough to matter. |
+| Charging, or driving | A force-upload request every `scan_interval` (default 60s) while the last energy data is under 15 minutes old. The car is already awake, so this is not a wake-up - and it is necessary, because the cloud's push fan-out stalls often enough to matter. After 15 minutes without data the integration asks passively until data returns, so a missed unplug or stop cannot leave a parked car in a force-upload loop. |
 | Parked and idle | One *passive* query per `parked_scan_interval` (default 1 hour). A sleeping car answers that with a small stub without waking. |
 
-A parked car is **never** force-woken on a schedule. The only force-upload sent
-to a possibly-sleeping car is a single one on a genuine Home Assistant restart,
-to seed the entity values.
+A parked car is **never** force-woken on a schedule. The only force-uploads sent
+to a possibly-sleeping car are a single one on a genuine Home Assistant restart,
+to seed the entity values, and the watchdog's stall escalation below. Both count
+toward one cap of two parked-car wakes a day.
 
 ### Stuck sessions get unstuck
 
@@ -219,20 +221,36 @@ clients under one account is the failure described in
 If the fan-out stays wedged and nothing meaningful arrives for 30 minutes, the
 watchdog escalates to one `cmd_type: 2` force-upload - the only thing that
 punches through a stalled fan-out - and then waits 12 hours before it may spend
-another, so a wedged cloud cannot turn into a car woken on a schedule. One
-exception: when the last state accepted said the car was **moving**, the
-force-upload cannot wake anything, so that escalation skips the 12-hour budget -
-one per 10 minutes, one per episode of motion - which is what keeps a mid-drive
-stall from freezing the sensors for the rest of the trip.
+another. The restart wake and the stall wake share a cap of two a day, so a wedged
+cloud cannot turn into a car woken on a schedule.
 
-While the push stream is wedged the REST widget fallback is the only thing still
-being polled, so it is also watched for movement: an odometer ahead of the last
-accepted push, or its own drive/gear state saying the car is not in P, counts as
-motion evidence (0.6.27). That lets the bounded escalation above fire while the
-pusher is stuck, instead of the 12-hour sleeping-car budget holding it - the case
-behind issue #3 on 2026-10-23 was 426 minutes without meaningful data while the
-REST odometer advanced 67 km. A `Standby` vehicle mode is not movement: the car
-is parked, so the sleeping-car budget still applies.
+A car that is already awake cannot be woken, so movement has a faster path of its
+own. While the push stream is silent the REST widget is the only thing still being
+read. Its odometer ahead of the highest one held counts as motion evidence when the
+widget `timer` (the car's last upload, in epoch milliseconds) is at most 6 minutes
+old; so does a drive or gear state that is not P. A rise with an older timer, or
+none, is merged and is never evidence: the car is asleep, and the log says so.
+After 2 minutes without energy data the watchdog sends one force-upload with reason
+`motion`, as soon as the widget read finds the evidence. It sends at most one per 5
+minutes and 24 a day, only for evidence under 10 minutes old and newer than the last
+arm. A `Standby` vehicle mode is not movement. While motion is suspected (fresh
+evidence, an arm in the last 10 minutes, or a widget that answers with an expired
+login during such an episode) the widget is read every 60 seconds instead of every
+`rest_scan_interval`. Saving new login tokens, or importing credentials, triggers an
+immediate widget read. An active `charging_hint` vetoes a motion arm; a stale
+`is_charging` does not, because a rising odometer is physical movement. A frame
+that carries its own drive block and shows P clears the evidence; a partial update
+without a drive block does not. This is the case behind issue #3 on 2026-10-23: 426
+minutes without meaningful data while the REST odometer advanced 67 km.
+
+Every force-upload is logged as `Force upload: reason=<reason> sent=<bool>
+today=<count>`, with reason `cold_start`, `stall`, `motion`, `active` or `user` (the
+`Wake vehicle` button, and the follow-up refresh of the sentinel switch and the
+lock). The polling status sensor reports `force_uploads_today`,
+`parked_wakes_today`, `motion_arms_today`, `last_force_upload_reason`,
+`last_force_upload_at`, `last_motion_evidence_at` and `last_motion_evidence`. A
+refused force-upload is logged at WARNING with its cause (`cap`, `hint`,
+`can_wake` or `backoff`), once per 10 minutes of continuous refusal.
 
 A reconnect while the last reported state is parked is logged at INFO: quiet
 telemetry alone does not establish a cloud routing fault. Active, unknown and
@@ -999,9 +1017,11 @@ car report again:
 - **Press `Wake vehicle`** - that request makes the car upload a full state. `Force
   update` will not help: it asks passively, and a sleeping car answers with a stub.
 - **The silence watchdog** does it once automatically after 30 minutes without data,
-  capped at one force-upload per 12 hours (0.6.20+ adds a second allowance while the
-  car was moving). If that budget was spent earlier, a stalled session can leave the
-  map stale until you wake it.
+  at most one per 12 hours and, with the restart wake, two parked-car wakes a day. A
+  car whose widget odometer rises while it is awake is armed separately within about
+  2 minutes (see [Stuck sessions get unstuck](#stuck-sessions-get-unstuck)). If the
+  parked-car budget was spent earlier, a stalled session can leave the map stale
+  until you wake it.
 
 Two attributes on the tracker answer "is this position real?": `coord_valid` is the
 car's own GPS-validity flag, and `fix_age_s` is the age of the last position that was
