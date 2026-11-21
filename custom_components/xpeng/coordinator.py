@@ -200,6 +200,13 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: force-upload cannot turn into a wake - see
         #: watchdog_policy.should_escalate_moving and drive_evidence.py.
         self.last_motion_at: float = 0.0
+        #: When the watchdog last sent a force-upload because of motion
+        #: evidence. A P frame right after an arm clears ``last_motion_at``, so
+        #: this is what keeps the fast widget poll open through a short stop.
+        self.last_motion_arm_at: float = 0.0
+        #: The last widget read was answered with an expired-login code while a
+        #: motion episode was open; cleared by the next good read.
+        self.widget_token_expired: bool = False
         #: The last position that was actually a GPS fix, and how old it is.
         #: ``interval.drive.coordValid`` says whether a frame's coordinates are a
         #: current fix or the car's last known position; see drive_evidence.py.
@@ -913,6 +920,35 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return (
             datetime.now(timezone.utc) - self.last_energy_data_timestamp
         ).total_seconds() > seconds
+
+    def energy_data_age_seconds(self) -> float:
+        """Seconds since the last energy-carrying frame; infinite when none yet."""
+        if self.last_energy_data_timestamp is None:
+            return float("inf")
+        return max(
+            0.0,
+            (datetime.now(timezone.utc) - self.last_energy_data_timestamp).total_seconds(),
+        )
+
+    def motion_evidence_fresh(self, max_age: float) -> bool:
+        """Whether motion evidence exists and is at most ``max_age`` seconds old."""
+        return bool(self.last_motion_at) and time.time() - self.last_motion_at <= max_age
+
+    def motion_suspected(self, max_age: float) -> bool:
+        """Whether a drive may be under way, so the widget deserves a fast poll.
+
+        True while motion evidence is fresh, for as long after a motion arm (a P
+        frame right after the arm clears the evidence), and while the widget
+        answers with an expired login during such an episode.
+        """
+        return (
+            self.motion_evidence_fresh(max_age)
+            or (
+                bool(self.last_motion_arm_at)
+                and time.time() - self.last_motion_arm_at <= max_age
+            )
+            or self.widget_token_expired
+        )
 
     def door_state_age_seconds(self) -> float | None:
         """Seconds since the ``door`` section was last really refreshed.

@@ -205,24 +205,23 @@ class TestTheEscalationIsReachable(unittest.TestCase):
         )
 
     def test_the_escalation_still_follows_it(self):
-        """The wake is still in the tick, and after the branch - not before it."""
+        """The wake is still decided in the tick, and after the branch - not before it."""
         tree = ast.parse(self.SOURCE)
-        for node in ast.walk(tree):
-            if not (
-                isinstance(node, ast.AsyncFunctionDef)
-                and node.name == "_silence_watchdog"
-            ):
-                continue
-            text = ast.unparse(node)
-            self.assertIn("sending ONE", text, "the force-upload escalation is gone")
-            self.assertIn("send_command", text, "the escalation no longer sends")
-            self.assertLess(
-                text.index("if silence < SILENCE_THRESHOLD"),
-                text.index("sending ONE"),
-                "the escalation must not sit before the silence branch",
-            )
-            return
-        raise AssertionError("_silence_watchdog not found")
+        nodes = {
+            node.name: ast.unparse(node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name in ("_silence_watchdog", "_motion_arm")
+        }
+        tick, arm = nodes["_silence_watchdog"], nodes["_motion_arm"]
+        self.assertIn("sending ONE", arm, "the force-upload escalation is gone")
+        self.assertIn("send_command", arm, "the escalation no longer sends")
+        self.assertIn("_motion_arm('watchdog')", tick, "the tick no longer escalates")
+        self.assertLess(
+            tick.index("if silence < SILENCE_THRESHOLD"),
+            tick.index("_motion_arm('watchdog')"),
+            "the escalation must not sit before the silence branch",
+        )
 
 
 class TestTheBackoffSurvivesAReload(unittest.TestCase):
@@ -275,7 +274,7 @@ class TestMotionEscalation(unittest.TestCase):
     """
 
     def test_the_motion_bound_is_the_documented_one(self):
-        self.assertEqual(policy.MOTION_ESCALATE_BACKOFF_SECONDS, 10 * MINUTE)
+        self.assertEqual(policy.MOTION_ESCALATE_BACKOFF_SECONDS, 5 * MINUTE)
 
     def test_it_is_shorter_than_the_sleeping_car_budget(self):
         """That difference is the whole point: the car is already awake."""
@@ -292,12 +291,44 @@ class TestMotionEscalation(unittest.TestCase):
         )
 
     def test_patience_still_applies(self):
-        """Motion is a reason to skip the 12h budget, not the 30 minute wait."""
+        """Motion is a reason to skip the 12h budget, not the caller's patience."""
+        now = 100_000.0
         self.assertFalse(
             policy.should_escalate_moving(
-                10 * MINUTE, 0.0, 100_000.0, last_motion_at=95_000.0
+                10 * MINUTE, 0.0, now, last_motion_at=now - MINUTE
             )
         )
+
+    def test_motion_patience_is_two_minutes_of_energy_silence(self):
+        now = 100_000.0
+        self.assertEqual(policy.MOTION_ESCALATE_AFTER_SECONDS, 2 * MINUTE)
+        for energy_age, expected in ((119, False), (120, True), (float("inf"), True)):
+            with self.subTest(energy_age=energy_age):
+                self.assertEqual(
+                    policy.should_escalate_moving(
+                        energy_age,
+                        0.0,
+                        now,
+                        last_motion_at=now - MINUTE,
+                        escalate_after=policy.MOTION_ESCALATE_AFTER_SECONDS,
+                    ),
+                    expected,
+                )
+
+    def test_motion_evidence_older_than_ten_minutes_buys_nothing(self):
+        now = 100_000.0
+        for age, expected in ((10 * MINUTE, True), (10 * MINUTE + 1, False)):
+            with self.subTest(evidence_age=age):
+                self.assertEqual(
+                    policy.should_escalate_moving(
+                        HOUR,
+                        0.0,
+                        now,
+                        last_motion_at=now - age,
+                        escalate_after=policy.MOTION_ESCALATE_AFTER_SECONDS,
+                    ),
+                    expected,
+                )
 
     def test_motion_escapes_a_budget_spent_an_hour_ago(self):
         """The exact shape of the capture: a wake an hour before, car moving."""
@@ -307,7 +338,7 @@ class TestMotionEscalation(unittest.TestCase):
                 policy.ESCALATE_AFTER_SECONDS,
                 last_escalation=now - HOUR,
                 now=now,
-                last_motion_at=now - policy.ESCALATE_AFTER_SECONDS,
+                last_motion_at=now - MINUTE,
             )
         )
 
@@ -318,9 +349,22 @@ class TestMotionEscalation(unittest.TestCase):
         self.assertFalse(
             policy.should_escalate_moving(
                 2 * HOUR,
-                last_escalation=now - 20 * MINUTE,
+                last_escalation=now - 6 * MINUTE,
                 now=now,
-                last_motion_at=now - 2 * HOUR,
+                last_motion_at=now - 8 * MINUTE,
+            )
+        )
+
+    def test_the_same_rise_never_arms_twice(self):
+        now = 100_000.0
+        evidence = now - 4 * MINUTE
+        first = policy.should_escalate_moving(
+            HOUR, 0.0, now - 3 * MINUTE, last_motion_at=evidence
+        )
+        self.assertTrue(first)
+        self.assertFalse(
+            policy.should_escalate_moving(
+                HOUR, now - 3 * MINUTE, now + 6 * MINUTE, last_motion_at=evidence
             )
         )
 
@@ -329,17 +373,28 @@ class TestMotionEscalation(unittest.TestCase):
         self.assertFalse(
             policy.should_escalate_moving(
                 2 * HOUR,
-                last_escalation=now - 5 * MINUTE,
+                last_escalation=now - 4 * MINUTE,
                 now=now,
-                last_motion_at=now - 2 * HOUR,
+                last_motion_at=now - MINUTE,
+            )
+        )
+
+    def test_a_rise_after_a_burst_rearms_after_five_minutes(self):
+        now = 100_000.0
+        self.assertFalse(
+            policy.should_escalate_moving(
+                2 * HOUR,
+                last_escalation=now - 5 * MINUTE + 1,
+                now=now,
+                last_motion_at=now - MINUTE,
             )
         )
         self.assertTrue(
             policy.should_escalate_moving(
                 2 * HOUR,
-                last_escalation=now - 2 * MINUTE,
-                now=now + policy.MOTION_ESCALATE_BACKOFF_SECONDS,
-                last_motion_at=now - 2 * MINUTE + 1,
+                last_escalation=now - 5 * MINUTE,
+                now=now,
+                last_motion_at=now - MINUTE,
             )
         )
 

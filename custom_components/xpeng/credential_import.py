@@ -24,8 +24,13 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from . import _clear_reauth_repair, _record_credential_success
+from . import (
+    _clear_reauth_repair,
+    _record_credential_success,
+    tokens_updated_signal,
+)
 from .config_flow import (
     _import_mqtt_credentials,
     _read_text_file,
@@ -293,6 +298,7 @@ async def async_import_credentials(
             renewed_at=renewed_at,
             expires_at=expires_at,
         )
+        async_dispatcher_send(hass, tokens_updated_signal(entry.entry_id))
         _LOGGER.info(
             "Imported credentials for %s (device %s) - applied, no reload",
             resolved_vin or entry.title,

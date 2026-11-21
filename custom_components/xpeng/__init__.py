@@ -11,6 +11,10 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
+from homeassistant.helpers.dispatcher import (
+    async_dispatcher_connect,
+    async_dispatcher_send,
+)
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.storage import Store
 
@@ -24,6 +28,7 @@ from .watchdog_policy import (
     ESCALATE_AFTER_SECONDS,
     ESCALATE_BACKOFF_SECONDS,
     MOTION_ESCALATE_AFTER_SECONDS,
+    MOTION_EVIDENCE_MAX_AGE_SECONDS,
     should_escalate,
     should_escalate_moving,
 )
@@ -80,6 +85,7 @@ from .const import (
 from .coordinator import XPengDataCoordinator
 from .mqtt_client import XPengMQTTClient
 from .services import async_setup_services, async_unload_services
+from .xpeng_errors import is_token_expired_response
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -107,6 +113,11 @@ _REAUTH_ISSUE_ID = "reauth_required"
 #: a reload (and a restart). See ``_silence_watchdog``: the 12h gap it enforces is
 #: a promise about the car, so it cannot live only in the session's memory.
 _WATCHDOG_STORE_VERSION = 1
+
+#: Widget poll cadence while a drive is suspected (see
+#: ``XPengDataCoordinator.motion_suspected``). The all-day cadence stays
+#: ``rest_scan_interval``: 60 s all day would be 1440 reads a car.
+WIDGET_FAST_POLL_SECONDS = 60
 
 def _masked_vin(entry: ConfigEntry) -> str:
     """This entry's VIN with its uniquely-identifying tail hidden.
@@ -1631,9 +1642,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # load on the other REST endpoints.
     cancel_widget_fallback = None
     if api_available:
-        widget_timer_state: dict[str, Any] = {"cancel": None, "stopped": False}
+        widget_timer_state: dict[str, Any] = {
+            "cancel": None,
+            "stopped": False,
+            "busy": False,
+        }
 
         async def _poll_widget_fallback(_now: Any) -> None:
+            widget_timer_state["busy"] = True
             try:
                 if not coordinator.mqtt_energy_stale(
                     MOTION_ESCALATE_AFTER_SECONDS
@@ -1656,20 +1672,60 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _fetch_widget_state_sync, entry, vin, vehicle_type_code,
                     widget_raw_sink,
                 )
-                if widget:
+                if is_token_expired_response(widget):
+                    # Another login (the renewal app's) retired these tokens.
+                    # Nothing to refresh here and no REST poll to start: the
+                    # new tokens arrive by import or the credential loop, and
+                    # the fast cadence below keeps asking until they do.
+                    coordinator.widget_token_expired = (
+                        coordinator.widget_token_expired
+                        or coordinator.motion_suspected(MOTION_EVIDENCE_MAX_AGE_SECONDS)
+                    )
+                elif widget:
+                    coordinator.widget_token_expired = False
                     # The coordinator owns the gate, the motion evidence and the
                     # replay floor; this poll only supplies the read.
+                    evidence_before = coordinator.last_motion_at
                     coordinator.set_rest_data({"widget_state": widget})
+                    if coordinator.last_motion_at != evidence_before:
+                        # New evidence: arm now, not at the next tick.
+                        await _motion_arm("widget")
             except Exception:  # noqa: BLE001 - a fallback poll must not fail setup
                 _LOGGER.debug("Widget fallback poll failed", exc_info=True)
             finally:
+                widget_timer_state["busy"] = False
                 if not widget_timer_state["stopped"]:
+                    fast = coordinator.motion_suspected(MOTION_EVIDENCE_MAX_AGE_SECONDS)
                     widget_timer_state["cancel"] = async_call_later(
-                        hass, rest_scan_interval, _poll_widget_fallback
+                        hass,
+                        min(rest_scan_interval, WIDGET_FAST_POLL_SECONDS)
+                        if fast
+                        else rest_scan_interval,
+                        _poll_widget_fallback,
                     )
 
         widget_timer_state["cancel"] = async_call_later(
             hass, rest_scan_interval, _poll_widget_fallback
+        )
+
+        async def _on_tokens_updated() -> None:
+            """New login tokens: ask the widget now instead of at the next tick.
+
+            Replaces the pending timer, so there is still one poll chain. A poll
+            already running reschedules itself.
+            """
+            if widget_timer_state["stopped"] or widget_timer_state["busy"]:
+                return
+            if widget_timer_state["cancel"]:
+                widget_timer_state["cancel"]()
+            widget_timer_state["cancel"] = async_call_later(
+                hass, 0, _poll_widget_fallback
+            )
+
+        entry.async_on_unload(
+            async_dispatcher_connect(
+                hass, tokens_updated_signal(entry.entry_id), _on_tokens_updated
+            )
         )
 
         def cancel_widget_fallback_fn() -> None:
@@ -1723,6 +1779,143 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # is why 30 minutes here costs the car nothing at all.
     PARKED_RECONNECT_BACKOFF = 1800
 
+    async def _motion_arm(trigger: str) -> bool:
+        """Send the escalating force-upload when the policy allows it.
+
+        Two callers: the watchdog tick, which retries every minute, and the
+        widget poll, which calls it the moment new motion evidence arrives so a
+        drive does not wait for the next tick. ``last_escalation`` is written
+        before the first await, so the two cannot both send. Returns whether an
+        escalation was spent.
+        """
+        now_ts = time.time()
+        silence = now_ts - mqtt_client.last_state_msg_ts
+        # How long since a message actually CARRIED data, as opposed to how
+        # long since the topic said anything. A sleeping car's stub resets
+        # `silence` but not this, so a stall that produced only stubs cannot
+        # hide behind the reconnect cycle. This is the clock the parked-car
+        # escalation below is keyed on.
+        stale = now_ts - mqtt_client.last_meaningful_state_ts
+        last_escalation = watchdog_state["last_escalation"]
+        pending_escalation = should_escalate(stale, last_escalation, now_ts)
+        # Fresh motion evidence permits one bounded recovery attempt outside
+        # the 12 h sleeping-car budget, keyed on the age of the last
+        # energy-carrying frame. It does not prove the car is still moving
+        # after the stream has gone quiet. Issue #3, 2026-10-21: 16 refusals on
+        # that budget while driving, and 46 minutes of frozen telemetry. See
+        # watchdog_policy.should_escalate_moving.
+        motion_evidence_at = coordinator.last_motion_at
+        motion_escalation = should_escalate_moving(
+            coordinator.energy_data_age_seconds(),
+            last_escalation,
+            now_ts,
+            motion_evidence_at,
+            escalate_after=MOTION_ESCALATE_AFTER_SECONDS,
+        )
+        if motion_escalation and coordinator.external_charging_hint:
+            # A charger said current is flowing. Only that vetoes: a stale
+            # is_charging cannot, because a rising odometer is physical motion.
+            _LOGGER.debug("Motion arm (%s) vetoed by the external charging hint", trigger)
+            motion_escalation = False
+        if motion_escalation and not pending_escalation and not mqtt_client.connected:
+            # A publish that cannot go out must not spend the arm. The tick
+            # retries once the client is connected again.
+            return False
+        escalation_allowed = pending_escalation or motion_escalation
+        if not escalation_allowed:
+            if poll_status.is_escalated(
+                stale,
+                last_escalation,
+                now_ts,
+                escalate_after=ESCALATE_AFTER_SECONDS,
+                escalate_backoff=ESCALATE_BACKOFF_SECONDS,
+            ):
+                _LOGGER.debug(
+                    "Watchdog: %.1fmin stale but last force-upload was %.0fmin ago "
+                    "- holding off (one per %.0fh; last motion evidence %s)",
+                    stale / 60,
+                    (now_ts - last_escalation) / 60,
+                    ESCALATE_BACKOFF_SECONDS / 3600,
+                    (
+                        f"{(now_ts - coordinator.last_motion_at) / 60:.0f}min ago"
+                        if coordinator.last_motion_at
+                        else "none"
+                    ),
+                )
+            return False
+        watchdog_state["last_escalation"] = now_ts
+        watchdog_state["escalations"] += 1
+        if motion_escalation:
+            coordinator.last_motion_arm_at = now_ts
+        # Written before the send, and independent of it: the backoff exists to
+        # bound the wake, so the clock must not depend on the publish succeeding
+        # (a refused client is exactly when a wake attempt is most likely to be
+        # spent and least likely to have done anything).
+        try:
+            await watchdog_store.async_save({"last_escalation": now_ts})
+        except Exception:  # noqa: BLE001 - never let storage stop the escalation
+            _LOGGER.warning(
+                "Could not persist the watchdog escalation clock; the next "
+                "reload may allow an earlier wake than the 12h backoff promises",
+                exc_info=True,
+            )
+        try:
+            if coordinator.command_policy.can_wake():
+                if motion_escalation:
+                    _LOGGER.warning(
+                        "Motion arm (%s): %.0fs without energy data; motion "
+                        "evidence %.0fmin old, current motion is unconfirmed - "
+                        "sending ONE force-upload (may wake the car; bounded "
+                        "motion recovery outside the %.0fh parked-car budget)",
+                        trigger,
+                        coordinator.energy_data_age_seconds(),
+                        (now_ts - motion_evidence_at) / 60,
+                        ESCALATE_BACKOFF_SECONDS / 3600,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "Watchdog: %.0fmin without fresh vehicle data (state "
+                        "topic quiet %.0fs) - sending ONE force-upload "
+                        "(may wake the car; at most one per %.0fh without new "
+                        "motion evidence)",
+                        stale / 60, silence, ESCALATE_BACKOFF_SECONDS / 3600,
+                    )
+                await hass.async_add_executor_job(
+                    mqtt_client.send_command, vin, 19, {"cmd_type": 2}, 2
+                )
+            else:
+                # Escalation exists to wake a sleeping car. With waking
+                # switched off, the passive query is the most this may do - it
+                # is still worth sending, because a car that is awake answers
+                # it, and that is the case the escalation is usually meeting.
+                if motion_escalation:
+                    # Once per episode: refusals come at least one backoff
+                    # apart, so a gap longer than the evidence lifetime means a
+                    # new episode.
+                    last_refused = watchdog_state.get("motion_refused_at", 0.0)
+                    watchdog_state["motion_refused_at"] = now_ts
+                    log_refusal = (
+                        _LOGGER.warning
+                        if now_ts - last_refused > MOTION_EVIDENCE_MAX_AGE_SECONDS
+                        else _LOGGER.debug
+                    )
+                    log_refusal(
+                        "Motion arm (%s) refused: waking is disabled by the "
+                        "command permissions - sending a passive query "
+                        "instead, the car may stay silent",
+                        trigger,
+                    )
+                else:
+                    _LOGGER.info(
+                        "Watchdog: %.0fmin without fresh vehicle data (state topic "
+                        "quiet %.0fs); waking is disabled - sending a passive query",
+                        stale / 60, silence,
+                    )
+                await hass.async_add_executor_job(mqtt_client.send_query, vin)
+        except Exception:
+            _LOGGER.exception("Watchdog escalation force-upload failed")
+        return True
+
     async def _silence_watchdog(_now: Any) -> None:
         try:
             watchdog_state["tick_count"] += 1
@@ -1738,30 +1931,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # hide behind the reconnect cycle. This is the clock the escalation
             # below is keyed on.
             stale = time.time() - mqtt_client.last_meaningful_state_ts
-            # Computed once here because two consumers need the same answer:
-            # the status block below publishes it, and the escalation decision
-            # at the end of this tick acts on it. A LIVE predicate rather than
-            # `bool(last_escalation)` - the sticky form kept reporting
-            # "Escalated" for the rest of the session once a single force-upload
-            # had been spent, even after normal data resumed. It should mean "a
-            # force-upload is pending or was just spent, and nothing has arrived
-            # since".
-            pending_escalation = should_escalate(
-                stale, watchdog_state["last_escalation"], time.time()
-            )
-            # Last-known motion permits one bounded recovery attempt outside
-            # the 12 h sleeping-car budget. It does not prove the car is still
-            # moving after the stream has gone quiet. Issue #3, 2026-10-21:
-            # 16 refusals on that budget while driving, and 46 minutes of
-            # frozen telemetry. See watchdog_policy.should_escalate_moving.
-            motion_evidence_at = coordinator.last_motion_at
-            motion_escalation = should_escalate_moving(
-                stale,
-                watchdog_state["last_escalation"],
-                time.time(),
-                motion_evidence_at,
-            )
-            escalation_allowed = pending_escalation or motion_escalation
             escalated_now = poll_status.is_escalated(
                 stale,
                 watchdog_state["last_escalation"],
@@ -1808,7 +1977,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # refresh+reconnect and holds the same reconnect lock.
         if refresh_state.get("refreshing"):
             return
-        parked = coordinator.vehicle_parked is not False and not coordinator.is_charging
+        # Fresh motion evidence means the car is awake and being driven, so a
+        # disconnected client gets the cheap reconnect cadence, not the parked one.
+        motion_fresh = coordinator.motion_evidence_fresh(MOTION_EVIDENCE_MAX_AGE_SECONDS)
+        parked = (
+            coordinator.vehicle_parked is not False
+            and not coordinator.is_charging
+            and not motion_fresh
+        )
         reconnect_backoff = (
             PARKED_RECONNECT_BACKOFF if parked else RECONNECT_BACKOFF
         )
@@ -1916,72 +2092,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Keyed on `stale`, not `silence`. `silence` is the reconnect trigger and
         # a stub answers it, so it can be reset every reconnect cycle while no
         # data arrives; staleness only clears when a message carries something.
-        now_ts = time.time()
-        if not escalation_allowed:
-            if escalated_now:
-                _LOGGER.debug(
-                    "Watchdog: %.1fmin stale but last force-upload was %.0fmin ago "
-                    "— holding off (one per %.0fh; last motion evidence %s)",
-                    stale / 60,
-                    (now_ts - watchdog_state["last_escalation"]) / 60,
-                    ESCALATE_BACKOFF_SECONDS / 3600,
-                    (
-                        f"{(now_ts - coordinator.last_motion_at) / 60:.0f}min ago"
-                        if coordinator.last_motion_at
-                        else "none"
-                    ),
-                )
-            return
-        watchdog_state["last_escalation"] = now_ts
-        watchdog_state["escalations"] += 1
-        # Written before the send, and independent of it: the backoff exists to
-        # bound the wake, so the clock must not depend on the publish succeeding
-        # (a refused client is exactly when a wake attempt is most likely to be
-        # spent and least likely to have done anything).
-        try:
-            await watchdog_store.async_save({"last_escalation": now_ts})
-        except Exception:  # noqa: BLE001 - never let storage stop the escalation
-            _LOGGER.warning(
-                "Could not persist the watchdog escalation clock; the next "
-                "reload may allow an earlier wake than the 12h backoff promises",
-                exc_info=True,
-            )
-        try:
-            if coordinator.command_policy.can_wake():
-                if motion_escalation:
-                    _LOGGER.warning(
-                        "Watchdog: %.0fmin without fresh vehicle data; motion "
-                        "evidence %.0fmin old, current motion is unconfirmed — "
-                        "sending ONE force-upload (may wake the car; bounded "
-                        "motion recovery outside the %.0fh parked-car budget)",
-                        stale / 60,
-                        (now_ts - motion_evidence_at) / 60,
-                        ESCALATE_BACKOFF_SECONDS / 3600,
-                    )
-                else:
-                    _LOGGER.warning(
-                        "Watchdog: %.0fmin without fresh vehicle data (state "
-                        "topic quiet %.0fs) — sending ONE force-upload "
-                        "(may wake the car; at most one per %.0fh without new "
-                        "motion evidence)",
-                        stale / 60, silence, ESCALATE_BACKOFF_SECONDS / 3600,
-                    )
-                await hass.async_add_executor_job(
-                    mqtt_client.send_command, vin, 19, {"cmd_type": 2}, 2
-                )
-            else:
-                # Escalation exists to wake a sleeping car. With waking
-                # switched off, the passive query is the most this may do - it
-                # is still worth sending, because a car that is awake answers
-                # it, and that is the case the escalation is usually meeting.
-                _LOGGER.info(
-                    "Watchdog: %.0fmin without fresh vehicle data (state topic "
-                    "quiet %.0fs); waking is disabled — sending a passive query",
-                    stale / 60, silence,
-                )
-                await hass.async_add_executor_job(mqtt_client.send_query, vin)
-        except Exception:
-            _LOGGER.exception("Watchdog escalation force-upload failed")
+        await _motion_arm("watchdog")
 
     cancel_watchdog = async_track_time_interval(
         hass, _silence_watchdog, timedelta(seconds=60),
@@ -2194,6 +2305,11 @@ def _refresh_login_tokens_sync(
     _LOGGER.info("Login tokens refreshed successfully via refresh_token")
     return new_tokens
 
+def tokens_updated_signal(entry_id: str) -> str:
+    """Dispatcher signal sent when new login tokens are in the entry."""
+    return f"xpeng_tokens_updated_{entry_id}"
+
+
 def _write_minted_to_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -2220,6 +2336,8 @@ def _write_minted_to_entry(
     if skip_reload:
         refresh_state["skip_reload"] = True
     hass.config_entries.async_update_entry(entry, data=data)
+    if minted.get("_refreshed_tokens"):
+        async_dispatcher_send(hass, tokens_updated_signal(entry.entry_id))
 
 
 def _refresh_creds_sync(
