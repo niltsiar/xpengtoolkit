@@ -173,5 +173,50 @@ class OptionsAreWired(unittest.TestCase):
                     self.assertNotRegex(step["data"][option], re.compile(r"[{}]"))
 
 
+class WidgetBodyIsCaptured(unittest.TestCase):
+    """The REST widget body is recorded only while capture is on, from both polls."""
+
+    @staticmethod
+    def _setup_tree() -> ast.AST:
+        for node in ast.walk(TREE):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "async_setup_entry":
+                return node
+        raise AssertionError("async_setup_entry() not found in __init__.py")
+
+    def test_the_sink_is_only_built_when_capture_is_enabled(self) -> None:
+        tree = self._setup_tree()
+        guarded: dict[int, bool] = {}
+
+        def visit(node: ast.AST, in_capture_branch: bool) -> None:
+            if isinstance(node, ast.If) and "capture_enabled" in ast.dump(node.test):
+                in_capture_branch = True
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(isinstance(t, ast.Name) and t.id == "widget_raw_sink" for t in targets):
+                    is_none = isinstance(node.value, ast.Constant) and node.value.value is None
+                    guarded[node.lineno] = is_none or in_capture_branch
+            for child in ast.iter_child_nodes(node):
+                visit(child, in_capture_branch)
+
+        visit(tree, False)
+        self.assertGreaterEqual(len(guarded), 2, "widget_raw_sink is never built")
+        self.assertTrue(all(guarded.values()), f"built outside the capture branch: {guarded}")
+
+    def test_the_sink_files_frames_under_the_rest_topic(self) -> None:
+        body = " ".join(function_source("async_setup_entry").split())
+        self.assertIn(
+            "functools.partial( capture_recorder.submit, CAPTURE_TOPIC_WIDGET_STATE )", body
+        )
+
+    def test_both_widget_polls_hand_over_the_sink(self) -> None:
+        passed = [
+            node.id
+            for node in ast.walk(self._setup_tree())
+            if isinstance(node, ast.Name) and node.id == "widget_raw_sink"
+            and isinstance(node.ctx, ast.Load)
+        ]
+        self.assertEqual(len(passed), 2, "the heavy REST poll and the fast fallback poll")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

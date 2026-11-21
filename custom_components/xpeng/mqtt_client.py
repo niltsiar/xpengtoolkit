@@ -465,9 +465,9 @@ class XPengMQTTClient:
     ) -> None:
         """Set the raw-frame sink: (topic, payload, qos, retain).
 
-        Called from paho's network thread for every listener message, before any
-        decoding. Whatever it does must be non-blocking and must not raise; the
-        capture recorder's ``submit()`` is both, deliberately.
+        Called from paho's network thread for every listener message and every
+        frame on the primary topic, before any decoding. Whatever it does must be
+        non-blocking and must not raise; the capture recorder's ``submit()`` is both.
         """
         self._capture_callback = callback
 
@@ -1228,6 +1228,16 @@ class XPengMQTTClient:
             )
             return
 
+        # The listener path offers its own frames, so the primary topic is
+        # offered here: each frame reaches the sink once, whatever the topic.
+        if self._capture_callback is not None:
+            self._offer_capture(
+                topic,
+                payload_bytes,
+                int(msg.qos or 0),
+                bool(getattr(msg, "retain", False)),
+            )
+
         # Primary vehicle-state topic: this is the only thing that counts as
         # "the car is delivering data" for the silence watchdog.
         self._last_state_msg_ts = time.time()
@@ -1465,6 +1475,16 @@ class XPengMQTTClient:
         except Exception:
             _LOGGER.exception("Error parsing XPENG MQTT message")
 
+    def _offer_capture(
+        self, topic: str, payload: bytes, qos: int, retain: bool
+    ) -> None:
+        """Hand one raw frame to the capture sink, if there is one."""
+        if self._capture_callback is not None:
+            try:
+                self._capture_callback(topic, payload, qos, retain)
+            except Exception:  # noqa: BLE001 - capture must not drop the connection
+                _LOGGER.exception("Capture callback failed for %s", topic)
+
     def _handle_listener_message(
         self,
         topic: str,
@@ -1488,11 +1508,7 @@ class XPengMQTTClient:
         in, so for binary frames with no listener callback registered there is
         nothing below worth doing.
         """
-        if self._capture_callback is not None:
-            try:
-                self._capture_callback(topic, payload, qos, retain)
-            except Exception:  # noqa: BLE001 - capture must not drop the connection
-                _LOGGER.exception("Capture callback failed for %s", topic)
+        self._offer_capture(topic, payload, qos, retain)
 
         if self._listener_callback is None and payload[:16].lstrip()[:1] != b"{":
             return

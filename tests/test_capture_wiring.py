@@ -14,7 +14,9 @@ plugged into, because those are where a capture silently does nothing:
   exists for;
 * the expensive half of ``_handle_listener_message`` must not run when only
   capture is on. 0.4.30 proved that per-frame decode is load; this checks it is
-  actually skipped rather than merely moved.
+  actually skipped rather than merely moved;
+* the primary topic, which the integration parses and drops fields from, and the
+  REST widget body must reach the recorder as they arrived.
 
 Loaded by path with a paho stub: ``mqtt_client`` imports paho, which is not
 installed on a development host, but it does not import Home Assistant.
@@ -22,12 +24,17 @@ installed on a development host, but it does not import Home Assistant.
 
 from __future__ import annotations
 
+# Load the stdlib module before the component directory can shadow it.
+import calendar  # noqa: F401
 import importlib.util
 import json
 import pathlib
+import re
 # Cache the stdlib extension before component select.py can shadow it.
 import select  # noqa: F401
 import sys
+import tempfile
+import time
 import types
 import unittest
 
@@ -67,6 +74,14 @@ _SPEC = importlib.util.spec_from_file_location(
 mqtt_client = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = mqtt_client
 _SPEC.loader.exec_module(mqtt_client)
+
+
+def _load(name: str, filename: str):
+    spec = importlib.util.spec_from_file_location(name, _component.module_path(filename))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def make_client() -> object:
@@ -152,6 +167,109 @@ class LazyDecode(unittest.TestCase):
             "t", json.dumps({"msg_type": 3, "service_type": 19, "msg_content": {"a": 1}}).encode()
         )
         self.assertEqual(len(notifications), 1)
+
+
+def message(topic: str, payload: bytes, qos: int = 1, retain: bool = False):
+    return types.SimpleNamespace(topic=topic, payload=payload, qos=qos, retain=retain)
+
+
+class PrimaryTopic(unittest.TestCase):
+    """The primary topic is parsed and its unknown fields dropped, so capture is the only record."""
+
+    def test_the_sink_receives_the_primary_frame_as_it_arrived(self) -> None:
+        client = make_client()
+        seen: list[tuple] = []
+        client.set_capture_callback(lambda *args: seen.append(args))
+        # Odd spacing and a field the parser has never heard of: a decoded and
+        # re-serialised copy would lose both.
+        raw = b'{"msg_type":  1, "service_type": 19, "future_field": {"x": [1, 2]}}'
+        client._on_message(None, None, message(client.recv_topic, raw, qos=1, retain=True))
+        self.assertEqual(seen, [(client.recv_topic, raw, 1, True)])
+
+    def test_the_v2_topic_reaches_the_sink_once(self) -> None:
+        client = make_client()
+        seen: list[tuple] = []
+        client.set_capture_callback(lambda *args: seen.append(args))
+        client._on_message(None, None, message(client.recv_topic_v2, BINARY))
+        self.assertEqual([frame[:2] for frame in seen], [(client.recv_topic_v2, BINARY)])
+
+    def test_a_primary_topic_that_is_also_a_listener_topic_is_captured_once(self) -> None:
+        client = make_client()
+        client.configure_listener(
+            enabled=True,
+            topics=[client.recv_topic, client.recv_topic_v2],
+            discovery_enabled=False,
+            extra_topics=[client.recv_topic],
+        )
+        client.set_listener_callback(lambda *_args: None)
+        seen: list[str] = []
+        client.set_capture_callback(lambda topic, *_rest: seen.append(topic))
+        client._on_message(None, None, message(client.recv_topic, b'{"msg_type": 1}'))
+        client._on_message(None, None, message(client.recv_topic_v2, b'{"msg_type": 1}'))
+        self.assertEqual(seen, [client.recv_topic, client.recv_topic_v2])
+
+
+class RestWidgetBody(unittest.TestCase):
+    """The widget poll keeps a few fields; the recorder must get the whole body."""
+
+    BODY = '{"code": 200,  "data": {"soc": 61, "futureField": {"x": [1, 2]}}}'
+
+    def setUp(self) -> None:
+        self.api = _load("xpeng_api_capture_under_test", "xpeng_api.py")
+        self.capture = _load("capture_wiring_under_test", "capture.py")
+        # const.py imports Home Assistant, so the constant is read from the source.
+        const_source = _component.module_path("const.py").read_text(encoding="utf-8")
+        self.widget_topic = re.search(
+            r'^CAPTURE_TOPIC_WIDGET_STATE: Final = "([^"]+)"', const_source, re.M
+        ).group(1)
+        self._real_headers = self.api.build_authenticated_headers
+        self._real_send = self.api._send_api_request
+        self.api.build_authenticated_headers = lambda *a, **k: ({}, {})
+        self.api._send_api_request = lambda *a, **k: {"status": 200, "body": self.BODY}
+        self.addCleanup(setattr, self.api, "build_authenticated_headers", self._real_headers)
+        self.addCleanup(setattr, self.api, "_send_api_request", self._real_send)
+
+    def _widget(self, sink):
+        return self.api.get_vehicle_state(
+            None, {"_key_pool": []}, {}, "vin", "type", raw_body_sink=sink
+        )
+
+    def test_the_recorder_stores_the_body_under_the_rest_pseudo_topic(self) -> None:
+        import functools
+
+        import can_journal
+
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self.capture.CaptureRecorder(directory)
+            recorder.start()
+            self.addCleanup(recorder.stop, 5.0, "cleanup")
+            sink = functools.partial(recorder.submit, self.widget_topic)
+            self.assertEqual(self._widget(sink), {"soc": 61, "futureField": {"x": [1, 2]}})
+            deadline = time.monotonic() + 5.0
+            while recorder.frames < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            recorder.stop(5.0, "test")
+            found = list(can_journal.JournalReader(recorder.current_file).messages())
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].topic, "rest/biz/v5/widget/vehicle/state")
+        self.assertEqual(found[0].payload, self.BODY.encode("utf-8"))
+        self.assertEqual((found[0].qos, found[0].retain), (0, False))
+
+    def test_an_encrypted_body_reaches_the_sink_as_plaintext(self) -> None:
+        plain = '{"soc": 61, "futureField": 7}'
+        self.api._send_api_request = lambda *a, **k: {
+            "status": 200, "body": '{"code": 200, "data": {"sData": "opaque"}}'
+        }
+        self.api.decrypt_xtee_blob_flexible = lambda blob, pool: plain.encode("utf-8")
+        seen: list[bytes] = []
+        self.assertEqual(self._widget(seen.append)["soc"], 61)
+        self.assertEqual(seen, [plain.encode("utf-8")])
+
+    def test_a_failing_sink_does_not_fail_the_poll(self) -> None:
+        def explode(_body):
+            raise RuntimeError("capture bug")
+
+        self.assertEqual(self._widget(explode)["soc"], 61)
 
 
 class ListenerTopics(unittest.TestCase):

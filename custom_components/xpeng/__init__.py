@@ -28,6 +28,7 @@ from .watchdog_policy import (
 )
 
 from .const import (
+    CAPTURE_TOPIC_WIDGET_STATE,
     CONF_ABRP_TOKEN,
     CONF_CAPTURE_ENABLED,
     CONF_CAPTURE_PATH,
@@ -1166,6 +1167,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     capture_recorder = None
+    widget_raw_sink: Any = None
     if capture_enabled:
         # Empty means "the known CAN topics", which is what someone enabling a
         # capture almost always wants; a typed list replaces them entirely.
@@ -1192,6 +1194,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             capture_recorder = None
         else:
             mqtt_client.set_capture_callback(capture_recorder.submit)
+            widget_raw_sink = functools.partial(
+                capture_recorder.submit, CAPTURE_TOPIC_WIDGET_STATE
+            )
             _LOGGER.info(
                 "Raw capture recording to %s (%d topics); decode it offline with "
                 "tools/xpeng_can_decode.py", capture_dir, len(capture_topics),
@@ -1566,6 +1571,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 rest_data = await hass.async_add_executor_job(
                     _fetch_rest_data_sync, entry, vin,
                     coordinator.latitude, coordinator.longitude,
+                    widget_raw_sink,
                 )
                 if rest_data and rest_data.get("_token_expired"):
                     _LOGGER.warning("REST poll detected expired tokens — triggering reauth")
@@ -1646,7 +1652,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     )
                     return
                 widget = await hass.async_add_executor_job(
-                    _fetch_widget_state_sync, entry, vin, vehicle_type_code
+                    _fetch_widget_state_sync, entry, vin, vehicle_type_code,
+                    widget_raw_sink,
                 )
                 if widget:
                     # The coordinator owns the gate, the motion evidence and the
@@ -2263,7 +2270,10 @@ def _refresh_creds_sync(
     return credentials
 
 def _fetch_widget_state_sync(
-    entry: ConfigEntry, vin: str, vehicle_type_code: str
+    entry: ConfigEntry,
+    vin: str,
+    vehicle_type_code: str,
+    raw_body_sink: Any = None,
 ) -> dict[str, Any] | None:
     """Read only the widget snapshot (blocking), for the fast fallback poll.
 
@@ -2283,7 +2293,8 @@ def _fetch_widget_state_sync(
     tokens, tenant = _load_api_context(entry)
     if not tokens or not tenant:
         return None
-    state = get_vehicle_state(None, tenant, tokens, vin, vehicle_type_code or "")
+    state = get_vehicle_state(None, tenant, tokens, vin, vehicle_type_code or "",
+                              raw_body_sink=raw_body_sink)
     return state if isinstance(state, dict) else None
 
 def _fetch_rest_data_sync(
@@ -2291,6 +2302,7 @@ def _fetch_rest_data_sync(
     vin: str,
     latitude: float | None = None,
     longitude: float | None = None,
+    widget_raw_sink: Any = None,
 ) -> dict[str, Any] | None:
     """Fetch supplementary REST data (blocking)."""
     from .xpeng_api import (
@@ -2444,7 +2456,9 @@ def _fetch_rest_data_sync(
     vtc = result.get("vehicle_type_code") or ""
     if vtc:
         try:
-            state_data = get_vehicle_state(None, tenant, tokens, vin, vtc)
+            state_data = get_vehicle_state(
+                None, tenant, tokens, vin, vtc, raw_body_sink=widget_raw_sink
+            )
             if isinstance(state_data, dict):
                 result["widget_state"] = state_data
         except Exception as err:
