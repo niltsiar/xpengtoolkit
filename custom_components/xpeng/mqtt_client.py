@@ -283,7 +283,7 @@ class XPengMQTTClient:
         self._listener_callback: Callable[[str, str], None] | None = None
         # Raw-frame sink for the capture recorder. Called with bytes, before any
         # decoding, because the whole point is to keep the bytes bytes.
-        self._capture_callback: Callable[[str, bytes, int, bool], None] | None = None
+        self._capture_callback: Callable[..., object] | None = None
         self._subscription_result_callback: Callable[[str, bool, str], None] | None = None
         self._notification_callback: Callable[[dict[str, Any]], None] | None = None
         self._command_feedback_callback: Callable[[dict[str, Any]], None] | None = None
@@ -461,9 +461,9 @@ class XPengMQTTClient:
         self._listener_callback = callback
 
     def set_capture_callback(
-        self, callback: Callable[[str, bytes, int, bool], None] | None
+        self, callback: Callable[..., object] | None
     ) -> None:
-        """Set the raw-frame sink: (topic, payload, qos, retain).
+        """Set the raw-frame sink: ``callback(topic, payload, *, qos, retain)``.
 
         Called from paho's network thread for every listener message and every
         frame on the primary topic, before any decoding. Whatever it does must be
@@ -1481,7 +1481,7 @@ class XPengMQTTClient:
         """Hand one raw frame to the capture sink, if there is one."""
         if self._capture_callback is not None:
             try:
-                self._capture_callback(topic, payload, qos, retain)
+                self._capture_callback(topic, payload, qos=qos, retain=retain)
             except Exception:  # noqa: BLE001 - capture must not drop the connection
                 _LOGGER.exception("Capture callback failed for %s", topic)
 

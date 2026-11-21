@@ -84,6 +84,18 @@ def _load(name: str, filename: str):
     return module
 
 
+capture = _load("capture_wiring_under_test", "capture.py")
+
+
+def sink_into(seen: list):
+    """A sink with the real ``CaptureRecorder.submit`` signature: qos and retain are keyword-only."""
+
+    def sink(topic, payload, *, qos, retain):
+        seen.append((topic, payload, qos, retain))
+
+    return sink
+
+
 def make_client() -> object:
     return mqtt_client.XPengMQTTClient(
         client_id="xmart:app:1:2",
@@ -101,9 +113,7 @@ class CaptureSink(unittest.TestCase):
     def test_the_sink_receives_the_exact_bytes(self) -> None:
         client = make_client()
         seen: list[tuple] = []
-        client.set_capture_callback(lambda topic, payload, qos, retain: seen.append(
-            (topic, payload, qos, retain)
-        ))
+        client.set_capture_callback(sink_into(seen))
         client._handle_listener_message("Xmart/Car/94434/State/CanPack1s", BINARY, qos=1, retain=True)
         self.assertEqual(len(seen), 1)
         topic, payload, qos, retain = seen[0]
@@ -115,7 +125,7 @@ class CaptureSink(unittest.TestCase):
     def test_a_raising_sink_does_not_take_the_connection_down(self) -> None:
         client = make_client()
 
-        def explode(*_args):
+        def explode(*_args, **_kwargs):
             raise RuntimeError("capture bug")
 
         client.set_capture_callback(explode)
@@ -131,7 +141,7 @@ class CaptureSink(unittest.TestCase):
 
     def test_the_sink_is_offered_binary_before_anything_else_runs(self) -> None:
         client = make_client()
-        client.set_capture_callback(lambda *args: None)
+        client.set_capture_callback(lambda *_args, **_kwargs: None)
         client._handle_listener_message("t", BINARY)
         # The decode-and-log half never ran: no topic was announced, which is the
         # observable side effect of reaching the logging block.
@@ -152,7 +162,7 @@ class LazyDecode(unittest.TestCase):
 
     def test_binary_is_skipped_when_only_capture_is_on(self) -> None:
         client = make_client()
-        client.set_capture_callback(lambda *args: None)
+        client.set_capture_callback(lambda *_args, **_kwargs: None)
         client._handle_listener_message("t", BINARY)
         self.assertEqual(client._listener_logged_topics, set())
 
@@ -162,7 +172,7 @@ class LazyDecode(unittest.TestCase):
         client = make_client()
         notifications: list[dict] = []
         client.set_notification_callback(notifications.append)
-        client.set_capture_callback(lambda *args: None)
+        client.set_capture_callback(lambda *_args, **_kwargs: None)
         client._handle_listener_message(
             "t", json.dumps({"msg_type": 3, "service_type": 19, "msg_content": {"a": 1}}).encode()
         )
@@ -179,7 +189,7 @@ class PrimaryTopic(unittest.TestCase):
     def test_the_sink_receives_the_primary_frame_as_it_arrived(self) -> None:
         client = make_client()
         seen: list[tuple] = []
-        client.set_capture_callback(lambda *args: seen.append(args))
+        client.set_capture_callback(sink_into(seen))
         # Odd spacing and a field the parser has never heard of: a decoded and
         # re-serialised copy would lose both.
         raw = b'{"msg_type":  1, "service_type": 19, "future_field": {"x": [1, 2]}}'
@@ -189,7 +199,7 @@ class PrimaryTopic(unittest.TestCase):
     def test_the_v2_topic_reaches_the_sink_once(self) -> None:
         client = make_client()
         seen: list[tuple] = []
-        client.set_capture_callback(lambda *args: seen.append(args))
+        client.set_capture_callback(sink_into(seen))
         client._on_message(None, None, message(client.recv_topic_v2, BINARY))
         self.assertEqual([frame[:2] for frame in seen], [(client.recv_topic_v2, BINARY)])
 
@@ -203,10 +213,37 @@ class PrimaryTopic(unittest.TestCase):
         )
         client.set_listener_callback(lambda *_args: None)
         seen: list[str] = []
-        client.set_capture_callback(lambda topic, *_rest: seen.append(topic))
+        client.set_capture_callback(lambda topic, payload, **_kwargs: seen.append(topic))
         client._on_message(None, None, message(client.recv_topic, b'{"msg_type": 1}'))
         client._on_message(None, None, message(client.recv_topic_v2, b'{"msg_type": 1}'))
         self.assertEqual(seen, [client.recv_topic, client.recv_topic_v2])
+
+
+class RealRecorder(unittest.TestCase):
+    """The client wired to the real recorder, not a stand-in for its signature."""
+
+    def test_primary_and_listener_frames_land_in_the_file(self) -> None:
+        import can_journal
+
+        client = make_client()
+        listener_topic = "Xmart/Car/1/State/CanPack1s"
+        primary = b'{"msg_type":  1, "service_type": 19, "future_field": 1}'
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = capture.CaptureRecorder(directory)
+            recorder.start()
+            self.addCleanup(recorder.stop, 5.0, "cleanup")
+            client.set_capture_callback(recorder.submit)
+            client._on_message(None, None, message(client.recv_topic, primary, qos=1))
+            client._on_message(None, None, message(listener_topic, BINARY, qos=0, retain=True))
+            deadline = time.monotonic() + 5.0
+            while recorder.frames < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            recorder.stop(5.0, "test")
+            found = list(can_journal.JournalReader(recorder.current_file).messages())
+        self.assertEqual(
+            [(m.topic, m.payload, m.qos, m.retain) for m in found],
+            [(client.recv_topic, primary, 1, False), (listener_topic, BINARY, 0, True)],
+        )
 
 
 class RestWidgetBody(unittest.TestCase):
@@ -216,7 +253,6 @@ class RestWidgetBody(unittest.TestCase):
 
     def setUp(self) -> None:
         self.api = _load("xpeng_api_capture_under_test", "xpeng_api.py")
-        self.capture = _load("capture_wiring_under_test", "capture.py")
         # const.py imports Home Assistant, so the constant is read from the source.
         const_source = _component.module_path("const.py").read_text(encoding="utf-8")
         self.widget_topic = re.search(
@@ -240,7 +276,7 @@ class RestWidgetBody(unittest.TestCase):
         import can_journal
 
         with tempfile.TemporaryDirectory() as directory:
-            recorder = self.capture.CaptureRecorder(directory)
+            recorder = capture.CaptureRecorder(directory)
             recorder.start()
             self.addCleanup(recorder.stop, 5.0, "cleanup")
             sink = functools.partial(recorder.submit, self.widget_topic)
