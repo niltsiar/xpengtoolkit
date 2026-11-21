@@ -74,6 +74,12 @@ ESCALATE_BACKOFF_SECONDS: float = 12 * 3600
 #: cannot turn every watchdog tick into a force-upload.
 MOTION_ESCALATE_BACKOFF_SECONDS: float = 10 * 60
 
+#: Energy silence after which the fast widget poll asks for the widget. While
+#: the stream is healthy, energy frames arrive about every 60 s, so two minutes
+#: of silence means a burst ended or the car woke before the stream started; the
+#: widget odometer is then the only evidence of a drive.
+MOTION_ESCALATE_AFTER_SECONDS: float = 2 * 60
+
 
 def should_escalate(
     silence_seconds: float,

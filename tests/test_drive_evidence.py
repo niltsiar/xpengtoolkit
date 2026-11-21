@@ -265,21 +265,85 @@ class TheRestFallbackSaysTheCarMoved(unittest.TestCase):
     wait) of frozen telemetry.
     """
 
+    NOW = 1795280294.0
+
     @staticmethod
     def _held(odometer=62234):
         return {"msg_content": {"instant": {"odometer": {"total_mileage": odometer}}}}
 
+    @classmethod
+    def _awake_widget(cls, odometer, age_seconds=60):
+        """A widget whose ``timer`` (epoch milliseconds) is ``age_seconds`` old."""
+        return {
+            "odometer": {"total_mileage": odometer},
+            "timer": int((cls.NOW - age_seconds) * 1000),
+        }
+
     def test_an_odometer_ahead_of_the_held_state_is_evidence(self):
         is_moving, reason = evidence.rest_motion_evidence(
-            {"odometer": {"total_mileage": 62301}}, self._held(62234)
+            self._awake_widget(62301), self._held(62234), now=self.NOW
         )
         self.assertTrue(is_moving)
         self.assertIn("67", reason)
 
+    def test_the_timer_is_read_as_milliseconds(self):
+        self.assertEqual(
+            evidence.widget_timer_age({"timer": 1795280234000}, 1795280294.0), 60.0
+        )
+        # Read as seconds, this stamp would lie in the far future and look awake.
+        widget = self._awake_widget(62301, age_seconds=600)
+        self.assertEqual(
+            evidence.rest_motion_evidence(widget, self._held(), now=self.NOW),
+            (False, None),
+        )
+
+    def test_a_rise_with_a_timer_under_six_minutes_old_is_arming_evidence(self):
+        limit = evidence.WIDGET_AWAKE_MAX_AGE_SECONDS
+        self.assertEqual(limit, 360)
+        for age in (0, 60, limit):
+            with self.subTest(age=age):
+                self.assertTrue(
+                    evidence.rest_motion_evidence(
+                        self._awake_widget(62301, age), self._held(), now=self.NOW
+                    )[0]
+                )
+
+    def test_a_rise_with_a_timer_older_than_six_minutes_is_merge_only(self):
+        stale = self._awake_widget(62301, age_seconds=361)
+        no_timer = {"odometer": {"total_mileage": 62301}}
+        for widget in (stale, no_timer):
+            with self.subTest(widget=widget):
+                with self.assertLogs(level="DEBUG") as logs:
+                    result = evidence.rest_motion_evidence(
+                        widget, self._held(), now=self.NOW
+                    )
+                self.assertEqual(result, (False, None))
+                self.assertIn("car asleep", "\n".join(logs.output))
+
+    def test_a_drive_state_needs_no_timer(self):
+        self.assertTrue(
+            evidence.rest_motion_evidence(
+                {"drive": {"shift_state": 2}}, self._held(), now=self.NOW
+            )[0]
+        )
+
+    def test_the_highest_odometer_known_is_the_baseline(self):
+        widget = self._awake_widget(62301)
+        self.assertFalse(
+            evidence.rest_motion_evidence(
+                widget, self._held(62234), max_odometer=62301, now=self.NOW
+            )[0]
+        )
+        self.assertTrue(
+            evidence.rest_motion_evidence(
+                widget, None, max_odometer=62234, now=self.NOW
+            )[0]
+        )
+
     def test_an_equal_odometer_is_not_evidence(self):
         self.assertEqual(
             evidence.rest_motion_evidence(
-                {"odometer": {"total_mileage": 62234}}, self._held(62234)
+                self._awake_widget(62234), self._held(62234), now=self.NOW
             ),
             (False, None),
         )
@@ -287,7 +351,7 @@ class TheRestFallbackSaysTheCarMoved(unittest.TestCase):
     def test_rounding_noise_is_not_evidence(self):
         self.assertFalse(
             evidence.rest_motion_evidence(
-                {"odometer": {"total_mileage": 62233.6}}, self._held(62234)
+                self._awake_widget(62233.6), self._held(62234), now=self.NOW
             )[0]
         )
 
@@ -347,7 +411,7 @@ class TheIntegrationActuallyUsesIt(unittest.TestCase):
         self.assertIn("with_previous_fix", coordinator)
         self.assertIn('return drive_view(self._last_full_data)["parked"]', coordinator)
         self.assertIn("def parking_view", coordinator)
-        self.assertIn("self.note_drive_evidence(data)", coordinator)
+        self.assertIn("self.note_drive_evidence(data, has_drive_data)", coordinator)
         self.assertIn("data = with_previous_fix(data, self._last_full_data)", coordinator)
         self.assertIn("self.gps_fix.observe(data,", coordinator)
 

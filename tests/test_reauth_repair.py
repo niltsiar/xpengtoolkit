@@ -27,6 +27,7 @@ import re
 import sys
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import _component  # noqa: E402
@@ -540,6 +541,137 @@ class TestReauthRepair(unittest.TestCase):
             self.assertEqual(entry.reauth_started, 1, "reauth must still happen")
         finally:
             sys.modules["homeassistant.helpers.issue_registry"] = original
+
+
+class TheMintedCredentialsAreSaved(unittest.TestCase):
+    """Login tokens renewed while minting must reach the config entry.
+
+    ``_refresh_creds_sync`` used to drop them, so every mint repeated the
+    refresh with the entry's stale copy.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod, _ = _load_module()
+
+    def _entry(self):
+        entry = _Entry(data={"keep": "me"})
+        entry.options = {}
+        return entry
+
+    def _plain_mint(self, tokens, create, expired):
+        """A mint that needs no token renewal."""
+        api = sys.modules["custom_components.xpeng.xpeng_api"]
+        with mock.patch.object(
+            self.mod, "_load_api_context", return_value=(tokens, {"t": 1})
+        ), mock.patch.multiple(
+            api, LoginExpiredError=expired, create_mqtt_account=create, create=True
+        ):
+            return self.mod._refresh_creds_sync(self._entry(), None)
+
+    def test_refresh_creds_returns_the_refreshed_login_tokens(self):
+        class Expired(Exception):
+            pass
+
+        old = {"accessToken": "OLD", "refreshToken": "OLD-R"}
+        new = {"accessToken": "NEW", "refreshToken": "NEW-R"}
+        account = {"clientId": "xmart:app:1:dev", "password": "P2"}
+        seen = []
+
+        def create(_config, _tenant, tokens):
+            seen.append(tokens)
+            if tokens is old:
+                raise Expired("expired")
+            return dict(account)
+
+        api = sys.modules["custom_components.xpeng.xpeng_api"]
+        with mock.patch.object(
+            self.mod, "_load_api_context", return_value=(old, {"t": 1})
+        ), mock.patch.object(
+            self.mod, "_refresh_login_tokens_sync", return_value=new
+        ), mock.patch.multiple(
+            api, LoginExpiredError=Expired, create_mqtt_account=create, create=True
+        ):
+            creds = self.mod._refresh_creds_sync(self._entry(), None)
+            self.assertEqual(creds["_refreshed_tokens"], new)
+            self.assertEqual(creds["password"], "P2")
+            self.assertEqual(seen, [old, new], "the retry must use the new tokens")
+        self.assertNotIn("_refreshed_tokens", self._plain_mint(new, create, Expired))
+
+    def test_one_update_saves_the_credential_and_the_login_tokens(self):
+        updates = []
+        hass = types.SimpleNamespace(
+            config_entries=types.SimpleNamespace(
+                async_update_entry=lambda entry, data: updates.append(data)
+            )
+        )
+        refresh_state = {}
+        tokens = {"accessToken": "NEW"}
+        self.mod._write_minted_to_entry(
+            hass,
+            self._entry(),
+            refresh_state,
+            {"password": "P2", "clientId": "cid", "_refreshed_tokens": tokens},
+        )
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0][self.mod.CONF_LOGIN_TOKENS], tokens)
+        self.assertEqual(updates[0][self.mod.CONF_PASSWORD], "P2")
+        self.assertEqual(updates[0][self.mod.CONF_CLIENT_ID], "cid")
+        self.assertEqual(updates[0]["keep"], "me")
+        self.assertTrue(refresh_state["skip_reload"])
+
+    def test_an_unchanged_credential_leaves_the_reload_flag_alone(self):
+        """No update fires no listener, so a set flag would eat the next reload."""
+        entry = self._entry()
+        entry.data = {self.mod.CONF_PASSWORD: "P2"}
+        hass = types.SimpleNamespace(
+            config_entries=types.SimpleNamespace(
+                async_update_entry=lambda *a, **kw: self.fail("nothing changed")
+            )
+        )
+        refresh_state = {}
+        self.mod._write_minted_to_entry(hass, entry, refresh_state, {"password": "P2"})
+        self.assertNotIn("skip_reload", refresh_state)
+
+    def test_every_mint_caller_persists_login_tokens(self):
+        """A caller that mints without saving the tokens brings the bug back."""
+        tree = ast.parse((COMPONENT / "__init__.py").read_text(encoding="utf-8"))
+        names_in: dict[str, set[str]] = {}
+
+        def visit(node, scope):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    names_in.setdefault(child.name, set())
+                    visit(child, child.name)
+                    continue
+                if isinstance(child, ast.Name) and scope:
+                    names_in[scope].add(child.id)
+                visit(child, scope)
+
+        visit(tree, None)
+        saves = {"_persist_minted_credentials", "_write_minted_to_entry"}
+        minters = {
+            name
+            for name, used in names_in.items()
+            if used & {"_refresh_creds_sync", "_mint_with_lock"}
+        }
+        # The lock wrapper only forwards the result to its own caller.
+        minters.discard("_mint_with_lock")
+        self.assertEqual(
+            minters,
+            {
+                "async_setup_entry",
+                "_mint_for_connect",
+                "_refresh_mqtt_creds",
+                "_silence_watchdog",
+                "_handle_auth_failure",
+            },
+            "a new mint caller must be added here and must save the tokens",
+        )
+        for name in sorted(minters):
+            with self.subTest(caller=name):
+                self.assertTrue(names_in[name] & saves, f"{name} drops the tokens")
+        self.assertIn("_write_minted_to_entry", names_in["_persist_minted_credentials"])
 
 
 if __name__ == "__main__":

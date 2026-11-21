@@ -27,6 +27,7 @@ from __future__ import annotations
 import pathlib
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import _component  # noqa: E402
@@ -60,6 +61,22 @@ class ThePollUsesTheFallbacksOwnRules(unittest.TestCase):
             body.index("_fetch_widget_state_sync"),
             "the gate must be checked before the request",
         )
+
+    def test_it_runs_once_energy_is_two_minutes_old(self):
+        import test_energy_guard as eg
+
+        body = _poll_body()
+        self.assertIn("MOTION_ESCALATE_AFTER_SECONDS", body)
+        self.assertNotIn("WIDGET_MERGE_STALE_SECONDS", body)
+        policy = (COMP / "watchdog_policy.py").read_text(encoding="utf-8")
+        self.assertIn("MOTION_ESCALATE_AFTER_SECONDS: float = 2 * 60", policy)
+        coord = eg._coordinator_with(eg._state(60))
+        for age, stale in ((60, False), (180, True)):
+            with self.subTest(energy_age_s=age):
+                coord.last_energy_data_timestamp = datetime.now(
+                    timezone.utc
+                ) - timedelta(seconds=age)
+                self.assertEqual(coord.mqtt_energy_stale(120), stale)
 
     def test_it_runs_at_the_rest_interval_not_the_parked_one(self):
         body = _poll_body()

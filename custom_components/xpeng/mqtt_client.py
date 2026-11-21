@@ -1361,6 +1361,10 @@ class XPengMQTTClient:
                     # coordinator cannot tell a fresh lock report from a stale
                     # one after the merge.
                     "has_door_data": bool(instant.get("door")),
+                    # Only this frame's own drive block says anything about
+                    # parking: ``interval.drive`` rides in every partial with
+                    # speed 0, and a merged partial inherits the baseline's.
+                    "has_drive_data": bool(instant.get("drive")),
                 }
                 if self._state_callback is None or self._state_callback(vehicle_data) is not False:
                     # Store as last full content for merging with partial responses
@@ -1448,6 +1452,7 @@ class XPengMQTTClient:
                     # True only when THIS message carried a door block - see the
                     # full-state branch above and issue #32.
                     "has_door_data": bool(instant.get("door")),
+                    "has_drive_data": bool(instant.get("drive")),
                 }
                 # A partial can carry the stale snapshot's charge too, so the
                 # same acceptance test applies: a refused state must not stamp

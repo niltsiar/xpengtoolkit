@@ -32,6 +32,7 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
+import time
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -528,6 +529,7 @@ class TheWatchdogAnswerIsNotMarkedSpecial(unittest.TestCase):
             {
                 (
                     "has_door_data",
+                    "has_drive_data",
                     "has_fresh_energy_data",
                     "msg_content",
                     "vin",
@@ -537,13 +539,64 @@ class TheWatchdogAnswerIsNotMarkedSpecial(unittest.TestCase):
         )
 
 
-class TheFallbackGateHasOneDefinition(unittest.TestCase):
-    """The 5-minute gate is shared: the merge and the fast poll must agree.
+class AFrameClearsMotionEvidenceOnlyWithItsOwnDriveBlock(unittest.TestCase):
+    """Real client frames into the coordinator: ``interval.drive`` is no verdict.
 
-    The fast widget poll (issue #3, 2026-10-27) only spends a request while the
-    merge gate is open. If the two ever drift apart the poll either asks for
-    data its own merge will refuse, or never asks at all - and the detection
-    bound silently goes back to one parked interval.
+    Every partial carries ``interval.drive`` with speed 0 and is merged onto the
+    held state, so a P baseline made each one look like a parked frame and wiped
+    the evidence the REST fallback had just found.
+    """
+
+    def _frames(self):
+        import test_mqtt_state_delivery as delivery
+
+        client, calls = delivery._client(
+            {
+                "code": 200,
+                "instant": {
+                    "drive": {"shift_state": 4, "speed": 0},
+                    "odometer": {"total_mileage": 62234},
+                    "charge": {"battery_soc": 64},
+                },
+            }
+        )
+        held = {"msg_content": client._last_full_content, "vin": "TESTVIN0000000000"}
+        coord = _coordinator_with(held)
+        coord.last_motion_at = 123.0
+        return client, calls, coord, delivery
+
+    def test_a_partial_with_only_interval_drive_keeps_motion_evidence(self):
+        client, calls, coord, delivery = self._frames()
+        frame = delivery._state(
+            instant={"charge": {"battery_soc": 63}},
+            interval={"drive": {"speed": 0}},
+        )
+        client._on_message(None, None, delivery._Msg(frame))
+        self.assertFalse(calls[-1]["has_drive_data"])
+        self.assertTrue(coord.set_vehicle_data(calls[-1]))
+        self.assertEqual(coord.last_motion_at, 123.0)
+
+    def test_a_frame_with_its_own_p_clears_motion_evidence(self):
+        client, calls, coord, delivery = self._frames()
+        frame = delivery._state(
+            instant={
+                "drive": {"shift_state": 4, "speed": 0},
+                "charge": {"battery_soc": 63},
+            }
+        )
+        client._on_message(None, None, delivery._Msg(frame))
+        self.assertTrue(calls[-1]["has_drive_data"])
+        self.assertTrue(coord.set_vehicle_data(calls[-1]))
+        self.assertEqual(coord.last_motion_at, 0.0)
+
+
+class TheFallbackGateHasOneDefinition(unittest.TestCase):
+    """The 5-minute gate has one definition, and the merge uses it.
+
+    The fast widget poll (issue #3, 2026-10-27) asks earlier than the merge
+    gate opens, on purpose: the widget odometer is evidence of a drive, read
+    before the merge gate (see TheRestFallbackIsMotionEvidence). The merge
+    itself still waits for this gate.
     """
 
     def test_a_fresh_energy_frame_closes_the_gate(self):
@@ -781,11 +834,24 @@ class TheRestFallbackIsMotionEvidence(unittest.TestCase):
         coord._merge_widget_state_if_mqtt_stale(widget)
         return coord
 
+    @staticmethod
+    def _awake(**sections):
+        """A widget whose ``timer`` (epoch milliseconds) is one minute old."""
+        return {**sections, "timer": int((time.time() - 60) * 1000)}
+
     def test_an_odometer_advance_arms_the_motion_escalation(self):
+        coord = self._merge(
+            _state(60, odo=62234), self._awake(odometer={"total_mileage": 62301})
+        )
+        self.assertGreater(coord.last_motion_at, 0.0)
+
+    def test_an_odometer_advance_on_a_sleeping_car_is_merged_and_never_evidence(self):
         coord = self._merge(
             _state(60, odo=62234), {"odometer": {"total_mileage": 62301}}
         )
-        self.assertGreater(coord.last_motion_at, 0.0)
+        self.assertEqual(coord.last_motion_at, 0.0)
+        instant = coord._last_full_data["msg_content"]["instant"]
+        self.assertEqual(instant["odometer"]["total_mileage"], 62301)
 
     def test_a_drive_mode_that_is_not_park_arms_it(self):
         coord = self._merge(_state(60), {"drive": {"shift_state": 1}})
@@ -798,14 +864,20 @@ class TheRestFallbackIsMotionEvidence(unittest.TestCase):
         )
         self.assertEqual(coord.last_motion_at, 0.0)
 
-    def test_a_closed_gate_does_not_arm_it(self):
+    def test_evidence_is_found_while_the_merge_gate_is_closed(self):
         coord = _coordinator_with(_state(60, odo=62234))
         coord.last_energy_data_timestamp = datetime.now(timezone.utc)
         coord.last_data_timestamp = datetime.now(timezone.utc)
         coord._merge_widget_state_if_mqtt_stale(
-            {"odometer": {"total_mileage": 62301}}
+            self._awake(odometer={"total_mileage": 62301})
         )
-        self.assertEqual(coord.last_motion_at, 0.0)
+        self.assertGreater(coord.last_motion_at, 0.0)
+        instant = coord._last_full_data["msg_content"]["instant"]
+        self.assertEqual(
+            instant["odometer"]["total_mileage"],
+            62234,
+            "the merge keeps its own gate",
+        )
 
 
 class ASentinelWidgetIsNotAReplayAndIsNotMerged(unittest.TestCase):
@@ -866,7 +938,8 @@ class TheWiringIsPresent(unittest.TestCase):
         coord_src = (_component.component_dir() / "coordinator.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("rest_motion_evidence(widget, self._last_full_data)", coord_src)
+        self.assertIn("rest_motion_evidence(", coord_src)
+        self.assertIn("max_odometer=self.max_odometer", coord_src)
         self.assertIn("REST fallback shows the car moving", coord_src)
         self.assertIn("self.last_motion_at = time.time()", coord_src)
 
