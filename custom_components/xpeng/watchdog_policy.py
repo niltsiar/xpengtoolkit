@@ -107,7 +107,7 @@ def should_escalate(
     return True
 
 
-def should_escalate_moving(
+def motion_refusal(
     silence_seconds: float,
     last_escalation: float,
     now: float,
@@ -115,8 +115,14 @@ def should_escalate_moving(
     escalate_after: float = ESCALATE_AFTER_SECONDS,
     motion_backoff: float = MOTION_ESCALATE_BACKOFF_SECONDS,
     motion_max_age: float = MOTION_EVIDENCE_MAX_AGE_SECONDS,
-) -> bool:
-    """Whether motion evidence justifies a force-upload outside the 12 h budget.
+) -> str | None:
+    """Why motion evidence does not justify a force-upload outside the 12 h budget.
+
+    None means it does. Otherwise one of ``patience``, ``no_evidence``,
+    ``stale_evidence``, ``backoff`` or ``spent`` (the evidence is not newer than
+    the last escalation). Only ``backoff`` is a refusal of an arm that is
+    otherwise due: the others are the ordinary state of a car that is parked, or
+    whose stream is healthy.
 
     Measured on issue #3's capture (2026-10-21): the fanout stalled mid-drive at
     16:15, and from 16:46 until the cloud recovered by itself at 17:01 the
@@ -140,36 +146,6 @@ def should_escalate_moving(
     `last_motion_at` is 0.0 when the last accepted state said the car was parked
     or said nothing about driving; both mean "do not spend the sleeping car's
     allowance on this".
-    """
-    return (
-        motion_refusal(
-            silence_seconds,
-            last_escalation,
-            now,
-            last_motion_at,
-            escalate_after,
-            motion_backoff,
-            motion_max_age,
-        )
-        is None
-    )
-
-
-def motion_refusal(
-    silence_seconds: float,
-    last_escalation: float,
-    now: float,
-    last_motion_at: float,
-    escalate_after: float = ESCALATE_AFTER_SECONDS,
-    motion_backoff: float = MOTION_ESCALATE_BACKOFF_SECONDS,
-    motion_max_age: float = MOTION_EVIDENCE_MAX_AGE_SECONDS,
-) -> str | None:
-    """Why ``should_escalate_moving`` says no, or None when it says yes.
-
-    One of ``patience``, ``no_evidence``, ``stale_evidence``, ``backoff`` or
-    ``spent`` (the evidence is not newer than the last escalation). Only
-    ``backoff`` is a refusal of an arm that is otherwise due: the others are the
-    ordinary state of a car that is parked, or whose stream is healthy.
     """
     if silence_seconds < escalate_after:
         return "patience"
@@ -222,8 +198,7 @@ def counts_for_day(
 ) -> dict[str, int]:
     """The stored counts if they are from ``today`` (the local day), else none.
 
-    A store written before the counts existed has neither key, and starts the
-    day at zero.
+    A store without the count keys starts the day at zero.
     """
     if saved_day != today or not isinstance(saved_counts, Mapping):
         return {}
