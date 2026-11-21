@@ -22,7 +22,7 @@ Two jobs, both pure so a test can pin them without a car:
   ``instant.drive`` block no longer has to be read as "parked".
 
 ``moving`` is what the watchdog uses to decide that a force-upload cannot wake
-the car (see ``watchdog_policy.should_escalate_moving``), so it errs towards
+the car (see ``watchdog_policy.motion_refusal``), so it errs towards
 "No" on anything it cannot read.
 
 The same question has a second source when the push fan-out is wedged: the
@@ -216,14 +216,14 @@ def rest_motion_evidence(
         and baseline is not None
         and widget_odometer > baseline + ODOMETER_ADVANCE_TOLERANCE_KM
     ):
-        age = widget_timer_age(widget, time.time() if now is None else now)
+        at = time.time() if now is None else now
+        age = widget_timer_age(widget, at)
         if age is not None and age <= WIDGET_AWAKE_MAX_AGE_SECONDS:
             return True, (
                 f"odometer {widget_odometer:g} km is "
                 f"{widget_odometer - baseline:g} km ahead of the held "
                 f"{baseline:g} km"
             )
-        at = time.time() if now is None else now
         log = (
             _LOGGER.warning
             if at - _asleep_logged_at > _ASLEEP_LOG_INTERVAL_SECONDS

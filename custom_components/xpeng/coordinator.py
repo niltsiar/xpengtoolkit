@@ -198,7 +198,7 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: P - see drive_evidence.rest_motion_evidence). A frame that shows P
         #: resets it to 0.0. The watchdog reads this to justify an escalation a
         #: force-upload cannot turn into a wake - see
-        #: watchdog_policy.should_escalate_moving and drive_evidence.py.
+        #: watchdog_policy.motion_refusal and drive_evidence.py.
         self.last_motion_at: float = 0.0
         #: When the watchdog last sent a force-upload because of motion
         #: evidence. A P frame right after an arm clears ``last_motion_at``, so
@@ -1583,7 +1583,7 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         A car that was moving when the data stopped cannot be woken by a
         force-upload, so this is what lets the watchdog spend one outside the
-        12 h sleeping-car budget (watchdog_policy.should_escalate_moving). A
+        12 h sleeping-car budget (watchdog_policy.motion_refusal). A
         later frame that carries its own drive block and shows P clears it, so
         a car that has since parked cannot inherit the earlier drive's
         allowance. A partial without its own ``instant.drive`` is merged onto

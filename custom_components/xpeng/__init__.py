@@ -1294,8 +1294,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "last_escalation": float(saved_watchdog.get("last_escalation") or 0.0),
         "escalations": 0,
         # The local day the counts belong to, and what was sent that day by
-        # reason. Stored with the escalation clock: a cap on wakes is a promise
-        # about the car, so it has to outlive a reload.
+        # reason. Stored with the escalation clock so the caps survive a reload.
         "day": dt_util.now().date().isoformat(),
         "counts": {},
         # When each (reason, cause) refusal was last logged.
@@ -1793,7 +1792,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 ):
                     # The push stream is carrying energy data (about one frame
                     # a minute), so the widget has nothing to add. Two minutes
-                    # of silence is earlier than the merge gate on purpose: the
+                    # of silence is enough, earlier than the merge gate: the
                     # odometer it carries is the evidence of a drive.
                     return
                 vehicle_type_code = str(
@@ -1825,7 +1824,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     evidence_before = coordinator.last_motion_at
                     coordinator.set_rest_data({"widget_state": widget})
                     if coordinator.last_motion_at != evidence_before:
-                        # New evidence: arm now, not at the next tick.
                         await _motion_arm("widget")
             except Exception:  # noqa: BLE001 - a fallback poll must not fail setup
                 _LOGGER.debug("Widget fallback poll failed", exc_info=True)
@@ -1917,7 +1915,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # energy-carrying frame. It does not prove the car is still moving
         # after the stream has gone quiet. Issue #3, 2026-10-21: 16 refusals on
         # that budget while driving, and 46 minutes of frozen telemetry. See
-        # watchdog_policy.should_escalate_moving.
+        # watchdog_policy.motion_refusal.
         motion_evidence_at = coordinator.last_motion_at
         refusal = motion_refusal(
             coordinator.energy_data_age_seconds(),
@@ -1975,8 +1973,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     (now_ts - last_escalation) / 60,
                     ESCALATE_BACKOFF_SECONDS / 3600,
                     (
-                        f"{(now_ts - coordinator.last_motion_at) / 60:.0f}min ago"
-                        if coordinator.last_motion_at
+                        f"{(now_ts - motion_evidence_at) / 60:.0f}min ago"
+                        if motion_evidence_at
                         else "none"
                     ),
                 )
@@ -2515,7 +2513,6 @@ def _refresh_creds_sync(
         "expireTime": account.get("expireTime", ""),
     }
     if refreshed_tokens:
-        # The async callers persist these to the entry.
         credentials["_refreshed_tokens"] = refreshed_tokens
 
     # Success is a usable password, not merely "returned a dict": every caller

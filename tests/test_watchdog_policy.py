@@ -38,6 +38,11 @@ HOUR = 3600.0
 MINUTE = 60.0
 
 
+def _arms(*args, **kwargs):
+    """A motion arm is allowed when ``motion_refusal`` names no refusal."""
+    return policy.motion_refusal(*args, **kwargs) is None
+
+
 class TestBounds(unittest.TestCase):
     def test_the_documented_bounds_are_the_ones_used(self):
         """These are what the operator was told; a silent change is a bug."""
@@ -303,7 +308,7 @@ class TestMotionEscalation(unittest.TestCase):
     def test_the_sleeping_car_rule_still_applies_when_the_car_is_parked(self):
         """No motion evidence, no shortcut - the 12h budget is unchanged."""
         self.assertFalse(
-            policy.should_escalate_moving(
+            _arms(
                 4 * HOUR, 0.0, 100_000.0, last_motion_at=0.0
             )
         )
@@ -312,7 +317,7 @@ class TestMotionEscalation(unittest.TestCase):
         """Motion is a reason to skip the 12h budget, not the caller's patience."""
         now = 100_000.0
         self.assertFalse(
-            policy.should_escalate_moving(
+            _arms(
                 10 * MINUTE, 0.0, now, last_motion_at=now - MINUTE
             )
         )
@@ -323,7 +328,7 @@ class TestMotionEscalation(unittest.TestCase):
         for energy_age, expected in ((119, False), (120, True), (float("inf"), True)):
             with self.subTest(energy_age=energy_age):
                 self.assertEqual(
-                    policy.should_escalate_moving(
+                    _arms(
                         energy_age,
                         0.0,
                         now,
@@ -338,7 +343,7 @@ class TestMotionEscalation(unittest.TestCase):
         for age, expected in ((10 * MINUTE, True), (10 * MINUTE + 1, False)):
             with self.subTest(evidence_age=age):
                 self.assertEqual(
-                    policy.should_escalate_moving(
+                    _arms(
                         HOUR,
                         0.0,
                         now,
@@ -352,7 +357,7 @@ class TestMotionEscalation(unittest.TestCase):
         """The exact shape of the capture: a wake an hour before, car moving."""
         now = 100_000.0
         self.assertTrue(
-            policy.should_escalate_moving(
+            _arms(
                 policy.ESCALATE_AFTER_SECONDS,
                 last_escalation=now - HOUR,
                 now=now,
@@ -365,7 +370,7 @@ class TestMotionEscalation(unittest.TestCase):
         would escalate on the same stale evidence every tick."""
         now = 100_000.0
         self.assertFalse(
-            policy.should_escalate_moving(
+            _arms(
                 2 * HOUR,
                 last_escalation=now - 6 * MINUTE,
                 now=now,
@@ -376,12 +381,12 @@ class TestMotionEscalation(unittest.TestCase):
     def test_the_same_rise_never_arms_twice(self):
         now = 100_000.0
         evidence = now - 4 * MINUTE
-        first = policy.should_escalate_moving(
+        first = _arms(
             HOUR, 0.0, now - 3 * MINUTE, last_motion_at=evidence
         )
         self.assertTrue(first)
         self.assertFalse(
-            policy.should_escalate_moving(
+            _arms(
                 HOUR, now - 3 * MINUTE, now + 6 * MINUTE, last_motion_at=evidence
             )
         )
@@ -389,7 +394,7 @@ class TestMotionEscalation(unittest.TestCase):
     def test_a_cadence_still_applies_between_motion_escalations(self):
         now = 100_000.0
         self.assertFalse(
-            policy.should_escalate_moving(
+            _arms(
                 2 * HOUR,
                 last_escalation=now - 4 * MINUTE,
                 now=now,
@@ -400,7 +405,7 @@ class TestMotionEscalation(unittest.TestCase):
     def test_a_rise_after_a_burst_rearms_after_five_minutes(self):
         now = 100_000.0
         self.assertFalse(
-            policy.should_escalate_moving(
+            _arms(
                 2 * HOUR,
                 last_escalation=now - 5 * MINUTE + 1,
                 now=now,
@@ -408,7 +413,7 @@ class TestMotionEscalation(unittest.TestCase):
             )
         )
         self.assertTrue(
-            policy.should_escalate_moving(
+            _arms(
                 2 * HOUR,
                 last_escalation=now - 5 * MINUTE,
                 now=now,
