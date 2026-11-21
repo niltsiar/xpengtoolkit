@@ -23,6 +23,7 @@ from .sentinel_guard import with_previous_unreported
 from .watchdog_policy import (
     ESCALATE_AFTER_SECONDS,
     ESCALATE_BACKOFF_SECONDS,
+    MOTION_ESCALATE_AFTER_SECONDS,
     should_escalate,
     should_escalate_moving,
 )
@@ -76,7 +77,7 @@ from .const import (
     MQTT_DISCOVERY_CANDIDATES,
     PLATFORMS,
 )
-from .coordinator import WIDGET_MERGE_STALE_SECONDS, XPengDataCoordinator
+from .coordinator import XPengDataCoordinator
 from .mqtt_client import XPengMQTTClient
 from .services import async_setup_services, async_unload_services
 
@@ -791,6 +792,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _fresh = await hass.async_add_executor_job(
             _refresh_creds_sync, entry, refresh_state
         )
+        if _fresh:
+            # No update listener exists yet, so there is no reload to skip.
+            _write_minted_to_entry(
+                hass, entry, refresh_state, _fresh, skip_reload=False
+            )
         if _fresh and _fresh.get("password"):
             from .mqtt_client import expires_at_from_account
 
@@ -803,11 +809,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     user_id = _parts[2]
             password = _fresh["password"]
             server = _fresh.get("serverSsl") or server
-            refreshed = _fresh.get("_refreshed_tokens")
-            if refreshed:
-                hass.config_entries.async_update_entry(
-                    entry, data={**entry.data, CONF_LOGIN_TOKENS: refreshed}
-                )
             _LOGGER.info(
                 "Minted a fresh MQTT credential before the first connect "
                 "(expires in ~%ss)",
@@ -860,26 +861,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return _refresh_creds_sync(entry, refresh_state)
 
     def _persist_minted_credentials(minted: dict[str, Any]) -> None:
-        """Write a minted credential to the entry and stamp the sensor (loop)."""
-        password_new = str(minted.get("password") or "")
-        client_id_new = str(minted.get("clientId") or "")
-        if not password_new:
-            return
-        coordinator.set_credential_timestamp()
-        refresh_state["skip_reload"] = True
-        data = {**entry.data, CONF_PASSWORD: password_new}
-        if client_id_new:
-            data[CONF_CLIENT_ID] = client_id_new
-        hass.config_entries.async_update_entry(entry, data=data)
+        """Write a minted credential and renewed login tokens, stamp the sensor (loop)."""
+        if minted.get("password"):
+            coordinator.set_credential_timestamp()
+        _write_minted_to_entry(hass, entry, refresh_state, minted)
 
     def _mint_for_connect() -> dict[str, Any] | None:
         """Blocking provider the client calls when a connect needs a credential."""
         from .mqtt_client import expires_at_from_account
 
         minted = _mint_with_lock()
-        if not minted or not minted.get("password"):
+        if not minted:
             return None
         hass.loop.call_soon_threadsafe(_persist_minted_credentials, minted)
+        if not minted.get("password"):
+            return None
         return {
             "clientId": minted.get("clientId", ""),
             "password": minted["password"],
@@ -1389,6 +1385,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 from .mqtt_client import expires_at_from_account
 
                 new_creds = await hass.async_add_executor_job(_mint_with_lock)
+                if new_creds:
+                    # A minted password IS the success signal, whether or not it
+                    # differs from the one already in hand: XPENG normally
+                    # rotates it, but "same string" is not a failure, and
+                    # stamping inside the rotation guard below left the
+                    # credential age climbing through a perfectly healthy loop.
+                    # This also saves any login tokens renewed on the way.
+                    _persist_minted_credentials(new_creds)
                 if new_creds and new_creds.get("password"):
                     new_pw = new_creds["password"]
                     new_cid = new_creds.get("clientId", "")
@@ -1400,12 +1404,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     # by auth-failure callback, silence watchdog, or reload).
                     # Reconnecting on every refresh caused a 45s flapping storm
                     # that dropped Full state pushes (observed 2026-06-06).
-                    # A minted password IS the success signal, whether or not it
-                    # differs from the one already in hand: XPENG normally
-                    # rotates it, but "same string" is not a failure, and
-                    # stamping this inside the rotation guard below left the
-                    # credential age climbing through a perfectly healthy loop.
-                    coordinator.set_credential_timestamp()
                     pw_changed = new_pw != mqtt_client._password
                     cid_changed = bool(new_cid) and new_cid != mqtt_client._client_id
                     if pw_changed or cid_changed:
@@ -1413,13 +1411,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             client_id=new_cid,
                             password=new_pw,
                             expires_at=expires_at_from_account(new_creds),
-                        )
-                        refresh_state["skip_reload"] = True
-                        updated = {**entry.data, CONF_PASSWORD: new_pw}
-                        if new_cid:
-                            updated[CONF_CLIENT_ID] = new_cid
-                        hass.config_entries.async_update_entry(
-                            entry, data=updated,
                         )
                         _LOGGER.debug(
                             "API refresh: staged new credentials (pw=%s..., clientId=%s, cid_changed=%s) "
@@ -1637,10 +1628,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async def _poll_widget_fallback(_now: Any) -> None:
             try:
                 if not coordinator.mqtt_energy_stale(
-                    WIDGET_MERGE_STALE_SECONDS
+                    MOTION_ESCALATE_AFTER_SECONDS
                 ):
-                    # The push stream is carrying energy data; the widget has
-                    # nothing to add and the merge gate would refuse it anyway.
+                    # The push stream is carrying energy data (about one frame
+                    # a minute), so the widget has nothing to add. Two minutes
+                    # of silence is earlier than the merge gate on purpose: the
+                    # odometer it carries is the evidence of a drive.
                     return
                 vehicle_type_code = str(
                     getattr(coordinator, "vehicle_type_code", "") or ""
@@ -1875,6 +1868,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 fresh = await hass.async_add_executor_job(
                     _refresh_creds_sync, entry, refresh_state
                 )
+                if fresh:
+                    _persist_minted_credentials(fresh)
                 if fresh and fresh.get("password"):
                     from .mqtt_client import expires_at_from_account
 
@@ -2191,9 +2186,37 @@ def _refresh_login_tokens_sync(
     _LOGGER.info("Login tokens refreshed successfully via refresh_token")
     return new_tokens
 
+def _write_minted_to_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    refresh_state: dict,
+    minted: dict[str, Any],
+    skip_reload: bool = True,
+) -> None:
+    """Save a minted credential and any renewed login tokens in one entry update.
+
+    One update, because each one fires the update listener and the one-shot
+    ``skip_reload`` flag covers only the first. The flag is set only when the
+    data changes: an unchanged update fires no listener, so the flag would
+    outlive it and swallow the next real reload.
+    """
+    data = {**entry.data}
+    if minted.get("password"):
+        data[CONF_PASSWORD] = str(minted["password"])
+        if minted.get("clientId"):
+            data[CONF_CLIENT_ID] = str(minted["clientId"])
+    if minted.get("_refreshed_tokens"):
+        data[CONF_LOGIN_TOKENS] = minted["_refreshed_tokens"]
+    if data == dict(entry.data):
+        return
+    if skip_reload:
+        refresh_state["skip_reload"] = True
+    hass.config_entries.async_update_entry(entry, data=data)
+
+
 def _refresh_creds_sync(
     entry: ConfigEntry, refresh_state: dict | None = None
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     """Refresh MQTT credentials using best available token source (blocking).
 
     Returns the credential dict, plus `_refreshed_tokens` when the login tokens
@@ -2231,9 +2254,6 @@ def _refresh_creds_sync(
         # Retry with the new tokens directly rather than re-loading: the entry's
         # copy is the stale one, so a re-load would retry with what just failed.
         account = create_mqtt_account(None, tenant, refreshed_tokens)
-    if refreshed_tokens and account is not None:
-        # Hand them back so the async caller can persist them to the entry.
-        account = {**account, "_refreshed_tokens": refreshed_tokens}
 
     # Update token file with fresh MQTT account (keeps token file current)
     token_file = entry.options.get(CONF_TOKEN_FILE, "").strip()
@@ -2256,6 +2276,9 @@ def _refresh_creds_sync(
         "serverSsl": account.get("serverSsl", ""),
         "expireTime": account.get("expireTime", ""),
     }
+    if refreshed_tokens:
+        # The async callers persist these to the entry.
+        credentials["_refreshed_tokens"] = refreshed_tokens
 
     # Success is a usable password, not merely "returned a dict": every caller
     # treats an empty password as a failed cycle, so recording success here would
@@ -2690,21 +2713,11 @@ async def _handle_auth_failure(
                 new_creds = await hass.async_add_executor_job(
                     _refresh_creds_sync, entry, refresh_state
                 )
-                if new_creds and new_creds.get("password"):
-                    # If the login tokens had expired, they were renewed to get
-                    # this far. Persist them, or _load_api_context keeps
-                    # preferring the entry's stale copy and every cycle repeats
-                    # the whole refresh.
-                    refreshed_tokens = new_creds.pop("_refreshed_tokens", None)
-                    if refreshed_tokens:
-                        refresh_state["skip_reload"] = True
-                        hass.config_entries.async_update_entry(
-                            entry,
-                            data={**entry.data, CONF_LOGIN_TOKENS: refreshed_tokens},
-                        )
-                        _LOGGER.info(
-                            "Persisted refreshed login tokens to config entry"
-                        )
+                if new_creds:
+                    # Login tokens renewed on the way are saved even when the
+                    # mint itself failed, or _load_api_context keeps preferring
+                    # the entry's stale copy and every cycle repeats the refresh.
+                    _write_minted_to_entry(hass, entry, refresh_state, new_creds)
             except Exception:
                 _LOGGER.debug("API credential refresh failed", exc_info=True)
 
@@ -2728,13 +2741,6 @@ async def _handle_auth_failure(
             # this is the one path that both mints a password AND reconnects
             # with it, so it is the strongest success signal there is.
             _record_credential_success(refresh_state)
-
-            # Save new credentials to config
-            refresh_state["skip_reload"] = True
-            updated_data = {**entry.data, CONF_PASSWORD: new_password}
-            if new_client_id:
-                updated_data[CONF_CLIENT_ID] = new_client_id
-            hass.config_entries.async_update_entry(entry, data=updated_data)
 
             # Stage new credentials, then reconnect via the client's reconnect
             # lock so this can't collide with the silence watchdog and spawn a

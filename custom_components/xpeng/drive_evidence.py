@@ -36,7 +36,11 @@ inside the 12 h sleeping-car budget.
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
+
+_LOGGER = logging.getLogger(__name__)
 
 #: Shift encodings seen on this platform: strings from the MQTT push and small
 #: ints from the REST widget. 3 and 4 both mean P on the measurements we have.
@@ -50,6 +54,10 @@ VEHICLE_MODE_DRIVING: int = 2
 #: Odometer readings are whole kilometres, so a difference this small is between
 #: two snapshots of the same value rather than an advance.
 ODOMETER_ADVANCE_TOLERANCE_KM: float = 0.5
+
+#: Oldest widget ``timer`` that still proves the car is awake: one 300 s upload
+#: cycle plus 60 s.
+WIDGET_AWAKE_MAX_AGE_SECONDS: float = 360.0
 
 
 def _dig(container: Any, keys: tuple[str, ...]) -> Any:
@@ -154,13 +162,33 @@ def view(state: Any) -> dict[str, Any]:
     }
 
 
-def rest_motion_evidence(widget: Any, held: Any) -> tuple[bool, str | None]:
+def widget_timer_age(widget: Any, now: float) -> float | None:
+    """Seconds since the widget's ``timer`` stamp, or None when it has none.
+
+    ``timer`` is epoch milliseconds (for example ``1795280234000``).
+    """
+    stamp = _as_float(_dig(widget, ("timer",)))
+    if stamp is None:
+        return None
+    return now - stamp / 1000.0
+
+
+def rest_motion_evidence(
+    widget: Any,
+    held: Any,
+    *,
+    max_odometer: float | None = None,
+    now: float | None = None,
+) -> tuple[bool, str | None]:
     """Whether a REST widget snapshot shows movement the pushes have not sent.
 
     Two signals count, either one sufficient:
 
-    * the widget's ``odometer.total_mileage`` is ahead of the odometer the held
-      state carries - the car has driven since the last accepted push;
+    * the widget's ``odometer.total_mileage`` is ahead of the highest odometer
+      known (``max_odometer``, or the held state's when that is higher) and the
+      car is awake: the widget ``timer`` is at most
+      ``WIDGET_AWAKE_MAX_AGE_SECONDS`` old. A rise with an older or missing
+      timer is merged and is never evidence (the car is asleep);
     * the widget's own drive state is not P: ``drive.shift_state`` when the
       snapshot carries one (small ints from the widget, strings from a push),
       otherwise ``ext.vehicleMode`` == 2, Driving.
@@ -175,15 +203,26 @@ def rest_motion_evidence(widget: Any, held: Any) -> tuple[bool, str | None]:
     held_odometer = _as_float(
         _dig(held, ("msg_content", "instant", "odometer", "total_mileage"))
     )
+    known = [v for v in (held_odometer, _as_float(max_odometer)) if v is not None]
+    baseline = max(known) if known else None
     if (
         widget_odometer is not None
-        and held_odometer is not None
-        and widget_odometer > held_odometer + ODOMETER_ADVANCE_TOLERANCE_KM
+        and baseline is not None
+        and widget_odometer > baseline + ODOMETER_ADVANCE_TOLERANCE_KM
     ):
-        return True, (
-            f"odometer {widget_odometer:g} km is "
-            f"{widget_odometer - held_odometer:g} km ahead of the held "
-            f"{held_odometer:g} km"
+        age = widget_timer_age(widget, time.time() if now is None else now)
+        if age is not None and age <= WIDGET_AWAKE_MAX_AGE_SECONDS:
+            return True, (
+                f"odometer {widget_odometer:g} km is "
+                f"{widget_odometer - baseline:g} km ahead of the held "
+                f"{baseline:g} km"
+            )
+        _LOGGER.debug(
+            "Widget odometer is %g km ahead of the held %g km, but its timer is "
+            "%s: car asleep, merge only",
+            widget_odometer - baseline,
+            baseline,
+            "missing" if age is None else f"{age:.0f} s old",
         )
 
     shift_park = _shift_park(_dig(widget, ("drive", "shift_state")))

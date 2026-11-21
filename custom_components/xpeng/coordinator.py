@@ -460,6 +460,7 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         has_fresh_energy_data = data.pop("has_fresh_energy_data", False)
         has_door_data = data.pop("has_door_data", False)
+        has_drive_data = data.pop("has_drive_data", False)
         odometer = odometer_from_state(data)
         if is_replay(odometer, self.max_odometer):
             _LOGGER.warning(
@@ -497,7 +498,7 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Before _update_parked_consumption, which reads vehicle_parked; and
         # before the entities are notified, so a transition is logged with the
         # evidence that caused it (issue #3 diagnostics).
-        self.note_drive_evidence(data)
+        self.note_drive_evidence(data, has_drive_data)
         if has_fresh_energy_data:
             self.last_energy_data_timestamp = self.last_data_timestamp
         if has_door_data:
@@ -956,6 +957,25 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         if not isinstance(widget, dict):
             return
+        # The fallback is also the only evidence of movement while the push
+        # stream is wedged, and a force-upload cannot wake a moving car: an
+        # odometer ahead of the highest one held, or a drive state that is not
+        # P, lets the watchdog recover outside the 12 h sleeping-car budget.
+        # Issue #3 (2026-10-23): 426 minutes stale with a stuck "parked"
+        # verdict while the REST odometer advanced 67 km. Read before the merge
+        # gate: a burst of frames closes the gate for five minutes, and the
+        # drive that follows must not wait that long. See
+        # drive_evidence.rest_motion_evidence.
+        moving, motion_reason = rest_motion_evidence(
+            widget, self._last_full_data, max_odometer=self.max_odometer
+        )
+        if moving:
+            self.last_motion_at = time.time()
+            _LOGGER.info(
+                "REST fallback shows the car moving (%s) - arming the "
+                "bounded motion escalation",
+                motion_reason,
+            )
         now = datetime.now(timezone.utc)
         mqtt_stale = self.mqtt_energy_stale()
         _LOGGER.info(
@@ -993,21 +1013,6 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 widget_odometer, self.max_odometer,
             )
             return
-        # The fallback is also the only evidence of movement while the push
-        # stream is wedged, and a force-upload cannot wake a moving car: an
-        # odometer ahead of the held state, or a drive state that is not P,
-        # lets the watchdog recover outside the 12 h sleeping-car budget. Issue
-        # #3 (2026-10-23): 426 minutes stale with a stuck "parked" verdict
-        # while the REST odometer advanced 67 km. See
-        # drive_evidence.rest_motion_evidence.
-        moving, motion_reason = rest_motion_evidence(widget, self._last_full_data)
-        if moving:
-            self.last_motion_at = time.time()
-            _LOGGER.info(
-                "REST fallback shows the car moving while the push stream is "
-                "silent (%s) — arming the bounded motion escalation",
-                motion_reason,
-            )
         # widget has top-level keys like charge/hvac/door/window/odometer/ext/fuelTank
         widget_sections: dict[str, Any] = {}
         door_overlay: dict[str, int] = {}
@@ -1510,20 +1515,25 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         return drive_view(self._last_full_data)
 
-    def note_drive_evidence(self, data: dict[str, Any]) -> None:
+    def note_drive_evidence(
+        self, data: dict[str, Any], has_drive_data: bool
+    ) -> None:
         """Record whether the frame just accepted showed the car moving.
 
         A car that was moving when the data stopped cannot be woken by a
         force-upload, so this is what lets the watchdog spend one outside the
         12 h sleeping-car budget (watchdog_policy.should_escalate_moving). A
-        later frame showing P clears it, so a car that has since parked cannot
-        inherit the earlier drive's allowance. A frame with no drive block
-        leaves it alone: no evidence is not evidence of parking.
+        later frame that carries its own drive block and shows P clears it, so
+        a car that has since parked cannot inherit the earlier drive's
+        allowance. A partial without its own ``instant.drive`` is merged onto
+        the held state, so its P verdict is the baseline's and says nothing
+        about this frame; it leaves the evidence alone, as does a frame with no
+        drive block at all: no evidence is not evidence of parking.
         """
         view = drive_view(data)
         if view["moving"]:
             self.last_motion_at = time.time()
-        elif view["parked"]:
+        elif has_drive_data and view["parked"]:
             self.last_motion_at = 0.0
 
     @property
