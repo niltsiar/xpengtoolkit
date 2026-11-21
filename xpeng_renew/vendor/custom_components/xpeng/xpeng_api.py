@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import zlib
-from typing import Any
+from typing import Any, Callable
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding as sym_padding, serialization
@@ -1782,11 +1782,16 @@ def get_authenticated_data(
     base_url: str | None = None,
     client_mo_override: str | None = None,
     public_ca: bool = False,
+    raw_body_sink: Callable[[bytes], object] | None = None,
 ) -> Any:
     """Make an authenticated REST call to any XPENG endpoint.
 
     ``public_ca=True`` additionally trusts the system CA store, for endpoints
     that are not signed by the XPENG chain (see make_ssl_context).
+
+    ``raw_body_sink`` is offered the response body as received, or its
+    decrypted plaintext when the data is encrypted, so a caller can record
+    fields the code drops.
     """
     cfg = _get_config(config)
     if base_url is None:
@@ -1809,15 +1814,22 @@ def get_authenticated_data(
         )
     body_json = json.loads(raw_body)
     data = body_json.get("data")
+    sink_text = raw_body
     # Handle sData decryption if present
     if isinstance(data, dict) and data.get("sData"):
         key_pool = tenant["_key_pool"]
         plain = decrypt_xtee_blob_flexible(
             str(data["sData"]), key_pool
         ).decode("utf-8", errors="replace")
+        sink_text = plain
         json_start = plain.find("{")
         if json_start >= 0:
             data = json.loads(plain[json_start:])
+    if raw_body_sink is not None:
+        try:
+            raw_body_sink(sink_text.encode("utf-8"))
+        except Exception:  # noqa: BLE001 - recording must not fail the request
+            _LOGGER.debug("Raw body sink failed for %s", path, exc_info=True)
     return data if data is not None else body_json
 
 
@@ -1937,11 +1949,13 @@ def get_vehicle_state(
     tokens: dict[str, Any],
     vin: str,
     vehicle_type_code: str,
+    raw_body_sink: Callable[[bytes], object] | None = None,
 ) -> Any:
     """Fetch widget vehicle state."""
     body = compact_json({"vin": vin, "vehicleTypeCode": vehicle_type_code})
     return get_authenticated_data(
-        config, tenant, tokens, "/biz/v5/widget/vehicle/state", "POST", body
+        config, tenant, tokens, "/biz/v5/widget/vehicle/state", "POST", body,
+        raw_body_sink=raw_body_sink,
     )
 
 

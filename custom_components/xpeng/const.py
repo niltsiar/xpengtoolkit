@@ -219,6 +219,10 @@ DEFAULT_TESLAMATE_PORT: Final = 8200
 MQTT_SEND_TOPIC: Final = "Xmart/Send/User/{user_id}"
 MQTT_RECV_TOPIC: Final = "Xmart/Msg/User/{user_id}"
 
+#: Capture topic for the REST widget poll. It is no MQTT topic: the ``rest/``
+#: prefix keeps these frames apart from the broker's in a ``.xpgcan`` file.
+CAPTURE_TOPIC_WIDGET_STATE: Final = "rest/biz/v5/widget/vehicle/state"
+
 # Known XPENG MQTT topic candidates for discovery
 MQTT_DISCOVERY_CANDIDATES: Final = (
     "Xmart/Car/+/State/CanPack1s",
