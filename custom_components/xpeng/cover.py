@@ -152,6 +152,10 @@ class XPengCover(XPengEntity, CoverEntity):
                 "window_positions_closed_percent": self._window_positions(),
                 "open_behavior": "ventilation",
                 "close_supported": True,
+                **age_attributes(
+                    getattr(self.coordinator, "window_data_timestamp", None),
+                    section="window",
+                ),
             }
         if self._key == "trunk":
             # The trunk reads the door section too, which a sleeping car stops

@@ -192,6 +192,10 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: moves that clock while the lock state stays hours old (issue #32),
         #: which is why the lock and trunk expose this one's age instead.
         self.door_data_timestamp: datetime | None = None
+        #: The same clock for the ``window`` section: a push with its own
+        #: non-empty ``instant.window``, or a window command reply. Never the
+        #: widget, and not a restored state.
+        self.window_data_timestamp: datetime | None = None
         #: When the last accepted state showed the car *moving* (speed, or a
         #: shift other than P), or when the REST fallback saw it move while the
         #: push stream was silent (odometer ahead, or a drive state that is not
@@ -480,6 +484,7 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         has_fresh_energy_data = data.pop("has_fresh_energy_data", False)
         has_door_data = data.pop("has_door_data", False)
+        has_window_data = data.pop("has_window_data", False)
         has_drive_data = data.pop("has_drive_data", False)
         # Held before anything below replaces it: whether this frame moved an
         # energy value is decided against the state it is replacing.
@@ -528,6 +533,8 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.last_energy_data_timestamp = self.last_data_timestamp
         if has_door_data:
             self.door_data_timestamp = self.last_data_timestamp
+        if has_window_data:
+            self.window_data_timestamp = self.last_data_timestamp
         self.state_is_restored = False
         # Update the parked-drain estimate before notifying entities (reads the
         # freshly-set _last_full_data via vehicle_parked / is_charging).
@@ -1547,6 +1554,8 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # door data that arrives on purpose while the car is awake, so it
             # resets the age the entities report.
             self.door_data_timestamp = datetime.now(timezone.utc)
+        elif section == "window":
+            self.window_data_timestamp = datetime.now(timezone.utc)
         if self._baseline_sink is not None:
             self._baseline_sink(msg_content)
         _LOGGER.debug(

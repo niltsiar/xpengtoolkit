@@ -99,12 +99,15 @@ def widget_door_overlay(values: Any) -> tuple[dict[str, int], list[str]]:
 
 
 def age_attributes(
-    updated_at: datetime | None, now: datetime | None = None
+    updated_at: datetime | None,
+    now: datetime | None = None,
+    section: str = "door",
 ) -> dict[str, Any]:
-    """The ``door_state_*`` attributes for a lock or trunk entity.
+    """The ``<section>_state_*`` attributes for an entity reading that section.
 
-    ``updated_at`` is when the door section was last actually refreshed (a push
-    carrying it, a lock/trunk acknowledgement, or the widget fallback). None -
+    ``section`` is ``door`` (lock, trunk) or ``window``. ``updated_at`` is when
+    the section was last actually refreshed (a push carrying it, a command
+    acknowledgement, and for the door also the widget fallback). None -
     nothing carried it yet this session - yields no attributes rather than a
     flattering zero: the entity still reports the value it holds, and a card is
     told that nothing is known about its age.
@@ -115,8 +118,8 @@ def age_attributes(
         updated_at = updated_at.replace(tzinfo=timezone.utc)
     reference = now or datetime.now(timezone.utc)
     return {
-        "door_state_updated_at": updated_at.isoformat(timespec="seconds"),
-        "door_state_age_seconds": max(
+        f"{section}_state_updated_at": updated_at.isoformat(timespec="seconds"),
+        f"{section}_state_age_seconds": max(
             0, int((reference - updated_at).total_seconds())
         ),
     }

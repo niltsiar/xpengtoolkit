@@ -343,6 +343,13 @@ trunk can report a value hours old while every energy sensor in the same state
 is fresh. Those two attributes are the section's own clock, and they are absent
 until something has actually carried that section in the current session.
 
+The windows cover and the windows binary sensor (`any_window_open`) carry
+`window_state_updated_at` and `window_state_age_seconds` on the same terms. The
+car does not resend its window block after a door closes, so a position such as
+93 can stay in the state for minutes after the window shut. The clock moves only
+for a frame with its own `instant.window` block or a window command reply, never
+for the widget fallback or a restored state.
+
 Besides these entities the integration registers services for the same operations
 (and for things no entity covers, such as `execute_scene`, `trigger_ota`,
 `send_navigation` and the HVAC schedule CRUD calls). See the services page.

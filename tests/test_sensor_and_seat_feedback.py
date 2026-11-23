@@ -122,6 +122,32 @@ class GearSensor(unittest.TestCase):
         description, _ = shift_state_description()
         self.assertEqual(description.options, ["N", "D", "R", "P"])
 
+class WindowStateAge(unittest.TestCase):
+    def binary_sensor(self, key, stamp):
+        spec = importlib.util.spec_from_file_location("door_guard_age", COMP / "door_guard.py")
+        door_guard = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = door_guard
+        spec.loader.exec_module(door_guard)
+        cls = load_class("XPengBinarySensor", "binary_sensor.py",
+                         BinarySensorEntity=object, age_attributes=door_guard.age_attributes)
+        return cls(SimpleNamespace(raw=None, window_data_timestamp=stamp),
+                   SimpleNamespace(key=key))
+
+    def test_the_window_sensor_reports_the_age_of_its_section(self):
+        from datetime import datetime, timedelta, timezone
+        stamp = datetime.now(timezone.utc) - timedelta(minutes=5)
+        attrs = self.binary_sensor("any_window_open", stamp).extra_state_attributes
+        self.assertEqual(attrs["window_state_age_seconds"], 300)
+        self.assertEqual(attrs["window_state_updated_at"], stamp.isoformat(timespec="seconds"))
+
+    def test_no_stamp_means_no_attributes(self):
+        self.assertEqual(self.binary_sensor("any_window_open", None).extra_state_attributes, {})
+
+    def test_other_binary_sensors_carry_no_window_age(self):
+        from datetime import datetime, timezone
+        sensor = self.binary_sensor("bonnet", datetime.now(timezone.utc))
+        self.assertEqual(sensor.extra_state_attributes, {})
+
 class SeatPublication(unittest.IsolatedAsyncioTestCase):
     def seat(self, results, *, position=1, model=None):
         calls = []

@@ -27,6 +27,7 @@ from .coordinator import XPengDataCoordinator
 from .entity import XPengEntity
 from .entity_layout import include_legacy_entity
 from .command_policy import default_policy
+from .door_guard import age_attributes
 
 #: How much of the MQTT clientId the diagnostics show. The id is
 #: `<deviceId>:<...>:<userId>` and the deviceId is the identity this install
@@ -105,6 +106,21 @@ class XPengBinarySensor(XPengEntity, BinarySensorEntity):
 
         # Default: truthy check
         return bool(raw)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Age of the window section behind ``any_window_open``.
+
+        The car does not resend its window block after a door closes, so the
+        last value can stay for minutes; the attribute is the section's own
+        clock, absent until a frame or reply in this session carried it.
+        """
+        if self.entity_description.key == "any_window_open":
+            return age_attributes(
+                getattr(self.coordinator, "window_data_timestamp", None),
+                section="window",
+            )
+        return {}
 
 
 class _PolledHealthBinarySensor:
