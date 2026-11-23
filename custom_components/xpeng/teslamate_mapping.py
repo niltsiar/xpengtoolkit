@@ -487,10 +487,13 @@ def build_charge_state(
 ) -> dict[str, Any]:
     """Tesla's ``charge_state``.
 
-    ``charge_energy_added`` is the one value XPENG does not publish for the live
-    session (``chargeStatistics.usageElectricity`` describes the previous one),
-    so the provider tracks the session and passes the estimate in - without it
-    TeslaMate's charging statistics all read nil.
+    XPENG does publish the live session energy (``instant.charge.charge_capacity``,
+    the inlet energy), but this provider keeps its own SoC-based estimate and
+    passes it in: ``chargeStatistics.usageElectricity`` describes the previous
+    session, and without a value TeslaMate's charging statistics all read nil.
+    The relay forwards the estimate during a session and XpengMate history
+    replaces it afterwards; only the standalone engine maps ``charge_capacity``
+    live.
     """
     charge = charge_section(snapshot.raw)
     soc, range_miles = _battery(snapshot)

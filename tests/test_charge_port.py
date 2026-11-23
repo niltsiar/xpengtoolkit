@@ -153,6 +153,28 @@ class TestTheDescriptionsUseTheMapping(unittest.TestCase):
         self.assertIn("value_fn=charge_port_state", block)
         self.assertIn('value_path="msg_content.instant.charge"', block)
 
+    def test_the_session_energy_sensor_reads_the_inlet_counter_without_a_state_class(self):
+        block = self.SOURCE[self.SOURCE.index('key="charge_session_energy"'):]
+        block = block[: block.index("XPengSensorEntityDescription", 10)]
+        self.assertIn('value_path="msg_content.instant.charge.charge_capacity"', block)
+        self.assertIn("value_fn=session_energy_kwh", block)
+        self.assertNotIn("state_class", block)
+
+
+class TestTheSessionEnergy(unittest.TestCase):
+    def test_session_energy_rounds_float_noise_to_0_1_kwh(self):
+        self.assertEqual(port.session_energy_kwh(0.10000000149), 0.1)
+        self.assertEqual(port.session_energy_kwh(26.64), 26.6)
+        self.assertEqual(port.session_energy_kwh(7), 7.0)
+
+    def test_session_energy_refuses_negative_bool_and_text(self):
+        for value in (-0.1, -1, True, False, "12.5", None, [], {}):
+            self.assertIsNone(port.session_energy_kwh(value), value)
+
+    def test_session_energy_reads_zero_after_unplug(self):
+        self.assertEqual(port.session_energy_kwh(0), 0.0)
+        self.assertEqual(port.session_energy_kwh(0.0), 0.0)
+
 
 class TestTheChargingState(unittest.TestCase):
     """Code 15 is not "Scheduled" on this car.

@@ -343,6 +343,9 @@
       "trunk_power_timer": {
         "name": "Tidsur for strømuttak"
       },
+      "charge_session_energy": {
+        "name": "Energi denne ladingen"
+      },
       "last_charge_energy": {
         "name": "Energi siste lading"
       },

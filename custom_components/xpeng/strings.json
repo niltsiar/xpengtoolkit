@@ -343,6 +343,9 @@
       "trunk_power_timer": {
         "name": "Trunk power timer"
       },
+      "charge_session_energy": {
+        "name": "Charge session energy"
+      },
       "last_charge_energy": {
         "name": "Last charge energy"
       },

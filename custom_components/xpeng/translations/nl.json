@@ -343,6 +343,9 @@
       "trunk_power_timer": {
         "name": "V2L-uitschakeltimer"
       },
+      "charge_session_energy": {
+        "name": "Laadenergie huidige sessie"
+      },
       "last_charge_energy": {
         "name": "Laatste laadenergie"
       },

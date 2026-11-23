@@ -343,6 +343,9 @@
       "trunk_power_timer": {
         "name": "Tidsstyrning bagageuttag"
       },
+      "charge_session_energy": {
+        "name": "Energi pågående laddning"
+      },
       "last_charge_energy": {
         "name": "Energi senaste laddning"
       },
