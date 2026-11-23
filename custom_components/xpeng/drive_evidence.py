@@ -58,6 +58,15 @@ PARK_SHIFT_CODES: tuple[int, ...] = (3, 4)
 #: car is parked, so the sleeping-car budget still applies.
 VEHICLE_MODE_DRIVING: int = 2
 
+#: ``instant`` paths of fields that may hint at a stop without P. They are only
+#: reported by ``view``: a door, lock or seat change also happens mid-drive.
+STOP_HINT_FIELDS: dict[str, tuple[str, str]] = {
+    "door_lock_source": ("door", "door_lock_source"),
+    "driver_seat_state": ("seat", "driver_seat_state"),
+    "psngr_seat_occupancy_status": ("seat", "psngr_seat_occupancy_status"),
+    "car_igon_state": ("power", "car_igon_state"),
+}
+
 #: Odometer readings are whole kilometres, so a difference this small is between
 #: two snapshots of the same value rather than an advance.
 ODOMETER_ADVANCE_TOLERANCE_KM: float = 0.5
@@ -93,6 +102,11 @@ def _as_float(value: Any) -> float | None:
     return None
 
 
+def _hint(value: Any) -> Any:
+    """A stop hint, with the car's -1 "unsupported" read as absent."""
+    return None if value == -1 and not isinstance(value, bool) else value
+
+
 def _shift_park(shift: Any) -> bool | None:
     """Whether a shift_state means parked; None when it cannot be read."""
     if isinstance(shift, str):
@@ -111,7 +125,9 @@ def view(state: Any) -> dict[str, Any]:
     Returns a dict with the raw values (``shift_state``, ``instant_speed``,
     ``interval_speed``), ``gps`` as a ``(latitude, longitude)`` pair or None,
     the ``parked`` verdict (True / False / None), the ``reason`` behind it, and
-    ``moving`` - the evidence the escalation policy acts on.
+    ``moving`` - the evidence the escalation policy acts on, and ``stop_hints``,
+    the ``STOP_HINT_FIELDS`` values for the log (None when absent or -1, the
+    car's "unsupported").
     """
     content = state.get("msg_content") if isinstance(state, dict) else None
     instant = content.get("instant") if isinstance(content, dict) else None
@@ -153,6 +169,11 @@ def view(state: Any) -> dict[str, Any]:
             else:
                 parked, reason = False, f"shift_state {shift_state!r}"
 
+    stop_hints = {
+        name: _hint(_dig(content, ("instant", *path)))
+        for name, path in STOP_HINT_FIELDS.items()
+    }
+
     interval_speed_kmh = _as_float(interval_speed)
     moving = parked is False or (
         interval_speed_kmh is not None and interval_speed_kmh > 0
@@ -166,6 +187,7 @@ def view(state: Any) -> dict[str, Any]:
         "interval_speed": interval_speed,
         "gps": gps,
         "coord_valid": coord_valid(state),
+        "stop_hints": stop_hints,
     }
 
 

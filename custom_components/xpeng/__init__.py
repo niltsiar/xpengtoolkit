@@ -1012,7 +1012,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         gps_after = after.get("gps")
         _LOGGER.debug(
             "Drive evidence: parked=%s (%s) shift_state=%r instant_speed=%r "
-            "interval_speed=%r gps=%s gps_changed=%s coord_valid=%r",
+            "interval_speed=%r gps=%s gps_changed=%s coord_valid=%r stop_hints=%r",
             after.get("parked"),
             after.get("reason"),
             after.get("shift_state"),
@@ -1021,6 +1021,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "present" if gps_after else "absent",
             gps_before != gps_after,
             after.get("coord_valid"),
+            after.get("stop_hints"),
         )
         if before.get("parked") != after.get("parked"):
             _LOGGER.info(

@@ -21,10 +21,13 @@ missing - that same mismatch is what the capture could not resolve.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import logging
 import pathlib
 import sys
 import unittest
+from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import _component  # noqa: E402
@@ -411,6 +414,65 @@ class TheRestFallbackSaysTheCarMoved(unittest.TestCase):
                 {"odometer": {"total_mileage": 62301}}, None
             )[0]
         )
+
+
+def _stop_state(**sections):
+    state = _state({"shift_state": 1, "speed": 0})
+    state["msg_content"]["instant"].update(sections)
+    return state
+
+
+class StopHintsAreDiagnosticOnly(unittest.TestCase):
+    def test_stop_hints_are_reported_without_changing_the_verdict(self):
+        """A stop in D: the passenger door opens and the car unlocks."""
+        state = _stop_state(
+            door={"door_lock_source": 0, "passenger_door_ajar_st": 1},
+            seat={"driver_seat_state": 1, "psngr_seat_occupancy_status": 2},
+            power={"car_igon_state": 2},
+        )
+        view = evidence.view(state)
+        self.assertIs(view["parked"], False)
+        self.assertEqual(
+            view["stop_hints"],
+            {
+                "door_lock_source": 0,
+                "driver_seat_state": 1,
+                "psngr_seat_occupancy_status": 2,
+                "car_igon_state": 2,
+            },
+        )
+
+    def test_absent_and_unsupported_hints_read_as_none(self):
+        state = _stop_state(
+            door={"door_lock_source": -1}, seat={"driver_seat_state": -1.0}
+        )
+        self.assertEqual(
+            evidence.view(state)["stop_hints"],
+            {name: None for name in evidence.STOP_HINT_FIELDS},
+        )
+
+    def test_a_state_without_any_block_has_empty_hints(self):
+        self.assertEqual(
+            set(evidence.view(None)["stop_hints"]), set(evidence.STOP_HINT_FIELDS)
+        )
+
+    def test_the_drive_evidence_log_line_carries_the_hints(self):
+        tree = ast.parse((COMPONENT / "__init__.py").read_text(encoding="utf-8"))
+        node = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_log_drive_evidence"
+        )
+        logger = logging.getLogger("drive_evidence_log_test")
+        namespace = {"_LOGGER": logger, "Any": Any}
+        exec(compile(ast.Module([node], []), "__init__.py", "exec"), namespace)
+        view = evidence.view(
+            _stop_state(door={"door_lock_source": 0}, power={"car_igon_state": 2})
+        )
+        with self.assertLogs(logger, level="DEBUG") as logs:
+            namespace["_log_drive_evidence"](view, view, None)
+        self.assertIn("stop_hints=", logs.output[0])
+        self.assertIn("'door_lock_source': 0", logs.output[0])
+        self.assertIn("'car_igon_state': 2", logs.output[0])
 
 
 class TheIntegrationActuallyUsesIt(unittest.TestCase):
