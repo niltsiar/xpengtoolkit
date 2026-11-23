@@ -261,6 +261,10 @@ SHIFT_STATES: Final = {
     4: "P",
 }
 
+#: On a G6, code 3 is R (measured while reverse-parking, 2026-11-23). The sensor
+#: shows it as R on that model only; the table above stays the default.
+G6_REVERSE_SHIFT_CODE: Final = 3
+
 # Vehicle mode mapping
 VEHICLE_MODES: Final = {
     0: "Parked",
@@ -487,7 +491,7 @@ SENSOR_DESCRIPTIONS: tuple[XPengSensorEntityDescription, ...] = (
         value_path="msg_content.instant.drive.shift_state",
         icon="mdi:car-shift-pattern",
         device_class=SensorDeviceClass.ENUM,
-        options=list(SHIFT_STATES.values()),
+        options=list(dict.fromkeys(SHIFT_STATES.values())),
         value_fn=lambda v: SHIFT_STATES.get(v, str(v)),
     ),
     XPengSensorEntityDescription(

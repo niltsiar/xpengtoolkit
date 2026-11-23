@@ -5,6 +5,7 @@ import ast
 import asyncio
 from collections import deque
 import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -54,6 +55,72 @@ class EnumSensorValues(unittest.TestCase):
         self.assertIsNone(self.sensor(None).native_value)
     def test_numeric_sensor_is_not_restricted_by_enum_options(self):
         self.assertEqual(self.sensor(74, device_class="battery").native_value, 74)
+
+def shift_state_description():
+    """The real ``shift_state`` sensor description, read from const.py's source.
+
+    const.py imports Home Assistant, so the call is parsed and only its
+    ``options`` and ``value_fn`` expressions are evaluated.
+    """
+    tree = ast.parse((COMP / "const.py").read_text(encoding="utf-8"))
+    table = next(
+        ast.literal_eval(n.value) for n in tree.body
+        if isinstance(n, ast.AnnAssign) and getattr(n.target, "id", None) == "SHIFT_STATES"
+    )
+    reverse_code = next(
+        ast.literal_eval(n.value) for n in tree.body
+        if isinstance(n, ast.AnnAssign) and getattr(n.target, "id", None) == "G6_REVERSE_SHIFT_CODE"
+    )
+    call = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and any(k.arg == "key" and getattr(k.value, "value", None) == "shift_state"
+                for k in n.keywords)
+    )
+    ns = {"SHIFT_STATES": table}
+    fields = {
+        k.arg: eval(compile(ast.Expression(k.value), "const.py", "eval"), ns)
+        for k in call.keywords if k.arg in ("options", "value_fn")
+    }
+    return SimpleNamespace(
+        key="shift_state", value_path="shift_state", device_class="enum", **fields
+    ), reverse_code
+
+def decode_vin(vin):
+    spec = importlib.util.spec_from_file_location("vin_descriptor_gear", COMP / "vin_descriptor.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.decode(vin)
+
+class GearSensor(unittest.TestCase):
+    G6 = "L1NNSGHA1SB000001"
+    G9 = "L1NNSGHB1SB000001"
+    UNKNOWN = "L1NNSGHZ1SB000001"
+
+    def shown(self, vin, raw):
+        description, reverse_code = shift_state_description()
+        cls = load_class("XPengSensor", "sensor.py", G6_REVERSE_SHIFT_CODE=reverse_code)
+        coordinator = SimpleNamespace(raw=raw, vin_info=decode_vin(vin) if vin else None)
+        return cls(coordinator, description).native_value
+
+    def test_code_3_is_r_on_a_g6(self):
+        self.assertEqual(self.shown(self.G6, 3), "R")
+
+    def test_code_3_stays_p_on_every_other_model(self):
+        for vin in (self.G9, self.UNKNOWN, None):
+            with self.subTest(vin=vin):
+                self.assertEqual(self.shown(vin, 3), "P")
+
+    def test_the_other_codes_do_not_depend_on_the_model(self):
+        for vin in (self.G6, self.G9, self.UNKNOWN, None):
+            for raw, name in ((0, "N"), (1, "D"), (2, "R"), (4, "P")):
+                with self.subTest(vin=vin, raw=raw):
+                    self.assertEqual(self.shown(vin, raw), name)
+
+    def test_the_options_hold_each_gear_once(self):
+        description, _ = shift_state_description()
+        self.assertEqual(description.options, ["N", "D", "R", "P"])
 
 class SeatPublication(unittest.IsolatedAsyncioTestCase):
     def seat(self, results, *, position=1, model=None):

@@ -64,7 +64,10 @@ STREAM_COLUMNS: tuple[str, ...] = (
     "heading",
 )
 
-#: Shift lever positions, from ``const.SHIFT_STATES``. 3 and 4 both mean P.
+#: Shift lever positions, from ``const.SHIFT_STATES``. 3 and 4 both mean P. A G6
+#: sends 3 in reverse, but the sensor-only R is not mirrored here: TeslaMate-style
+#: consumers end a drive on P, and the car goes silent after R, so mapping 3 to R
+#: would hold every reverse-parked drive open until the next P frame.
 SHIFT_STATES: Mapping[int, str] = {0: "N", 1: "D", 2: "R", 3: "P", 4: "P"}
 
 #: ``ext.vehicleMode`` with the car being driven (``const.VEHICLE_MODES``).
