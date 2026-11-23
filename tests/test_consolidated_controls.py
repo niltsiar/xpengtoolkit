@@ -303,6 +303,38 @@ class DoorStateAgeTests(unittest.TestCase):
         )
         e.coordinator.door_data_timestamp = datetime.now(timezone.utc)
         self.assertNotIn("door_state_age_seconds", e.extra_state_attributes)
+    def _windows(self):
+        return cover.XPengCover(
+            coordinator(state(window={"front_left_window_position": 93})),
+            SimpleNamespace(),
+            "windows",
+        )
+
+    def test_the_windows_cover_reports_the_age_of_its_section(self):
+        e = self._windows()
+        e.coordinator.window_data_timestamp = (
+            datetime.now(timezone.utc) - timedelta(minutes=3)
+        )
+        attrs = e.extra_state_attributes
+        self.assertEqual(attrs["window_state_age_seconds"], 180)
+        self.assertTrue(attrs["window_state_updated_at"].endswith("+00:00"))
+        self.assertNotIn("door_state_age_seconds", attrs)
+
+    def test_a_windows_cover_without_a_stamp_reports_no_age(self):
+        e = self._windows()
+        e.coordinator.window_data_timestamp = None
+        self.assertNotIn("window_state_age_seconds", e.extra_state_attributes)
+        self.assertIn("window_positions_closed_percent", e.extra_state_attributes)
+
+    def test_the_trunk_does_not_claim_a_window_age(self):
+        e = cover.XPengCover(
+            coordinator(state(door={"trunk_ajar_st_new": 5})),
+            SimpleNamespace(),
+            "trunk",
+        )
+        e.coordinator.window_data_timestamp = datetime.now(timezone.utc)
+        self.assertNotIn("window_state_age_seconds", e.extra_state_attributes)
+
 
 class ChargingTests(unittest.IsolatedAsyncioTestCase):
     async def test_switch_uses_measured_state_and_validates_acceptance(self):

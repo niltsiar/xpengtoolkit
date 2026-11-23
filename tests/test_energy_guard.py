@@ -257,6 +257,7 @@ def _coordinator_with(held, *, parked_energy=None):
     coord._charging_hint_until = 0.0
     coord.gps_fix = coordinator.FixTracker()
     coord.last_motion_at = 0.0
+    coord.window_data_timestamp = None
     coord._persist_state = lambda: None
     coord._update_parked_consumption = lambda data: None
     return coord
@@ -531,6 +532,7 @@ class TheWatchdogAnswerIsNotMarkedSpecial(unittest.TestCase):
                     "has_door_data",
                     "has_drive_data",
                     "has_fresh_energy_data",
+                    "has_window_data",
                     "msg_content",
                     "vin",
                 )
