@@ -243,6 +243,18 @@ def charging_state_label(charge: Any) -> str | None:
     return CHARGING_STATES.get(code, f"Unknown ({code})")
 
 
+def session_energy_kwh(value: Any) -> float | None:
+    """Energy of the running charge session in kWh, rounded to 0.1.
+
+    ``instant.charge.charge_capacity`` is the energy at the inlet, so it also
+    counts preheat. It reads 0 after the cable comes out. A bool, a non-number
+    or a negative value is no reading.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return round(float(value), 1)
+
+
 #: Options key for "this car has motorized charge-port controls". Mirrored as
 #: ``const.CONF_CHARGE_PORT_CONTROLS`` (const.py imports this module), so the
 #: pure helper and the config option cannot drift apart.

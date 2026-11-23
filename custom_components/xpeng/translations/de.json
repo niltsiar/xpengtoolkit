@@ -343,6 +343,9 @@
       "trunk_power_timer": {
         "name": "Kofferraumsteckdose Timer"
       },
+      "charge_session_energy": {
+        "name": "Energie der aktuellen Ladung"
+      },
       "last_charge_energy": {
         "name": "Letzte Ladeenergie"
       },

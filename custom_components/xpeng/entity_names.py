@@ -55,6 +55,7 @@ ENGLISH_ENTITY_NAMES: dict[str, dict[str, str]] = {
         "passenger_seat_heat": "Passenger seat heating",
         "steering_wheel_heat": "Steering wheel heating",
         "trunk_power_timer": "Trunk power timer",
+        "charge_session_energy": "Charge session energy",
         "last_charge_energy": "Last charge energy",
         "last_charge_range": "Last charge range added",
         "last_charge_duration": "Last charge duration",

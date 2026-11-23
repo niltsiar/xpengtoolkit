@@ -90,6 +90,7 @@ interfaces, raw fan reading and independent cabin measurements remain available.
 
 | Entity | Type | Unit | Notes |
 | --- | --- | --- | --- |
+| `sensor.xpeng_<vehicle>_charge_session_energy` | sensor | kWh | Energy of the running charge session at the inlet (`instant.charge.charge_capacity`), rounded to 1 dp. It also counts preheat, and it reads 0 after unplug. Device class `energy`, **no** state class: it is the car's live figure, not a meter |
 | `sensor.xpeng_<vehicle>_last_charge_energy` | sensor | kWh | Energy taken by the last charge, rounded to 1 dp; device class `energy` but **no** state class (it is per-charge, not cumulative) |
 | `sensor.xpeng_<vehicle>_last_charge_range_added` | sensor | km | `chargeStatistics.addedRange` |
 | `sensor.xpeng_<vehicle>_last_charge_duration` | sensor | min | Source field is milliseconds; divided by 60,000 |

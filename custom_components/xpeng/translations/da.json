@@ -343,6 +343,9 @@
       "trunk_power_timer": {
         "name": "Timer for bagagerumsstrøm"
       },
+      "charge_session_energy": {
+        "name": "Energi i denne opladning"
+      },
       "last_charge_energy": {
         "name": "Energi ved seneste opladning"
       },

@@ -245,6 +245,7 @@ from .charge_port import (
     charge_cable_state,
     charge_port_state,
     charging_state_label,
+    session_energy_kwh,
 )
 
 
@@ -616,6 +617,17 @@ SENSOR_DESCRIPTIONS: tuple[XPengSensorEntityDescription, ...] = (
         icon="mdi:timer-outline",
     ),
     # === Last Charge Statistics ===
+    # No state_class, like last_charge_energy: the value is the car's live figure
+    # for this session and reads 0 after unplug.
+    XPengSensorEntityDescription(
+        key="charge_session_energy",
+        translation_key="charge_session_energy",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        value_path="msg_content.instant.charge.charge_capacity",
+        value_fn=session_energy_kwh,
+        icon="mdi:lightning-bolt",
+    ),
     XPengSensorEntityDescription(
         key="last_charge_energy",
         translation_key="last_charge_energy",
@@ -767,10 +779,8 @@ BINARY_SENSOR_DESCRIPTIONS: tuple[XPengBinarySensorEntityDescription, ...] = (
         # It arrives in every service-4 acknowledgement - the same flat charge
         # block as ``charge_status`` and ``max_range_charge`` (measured
         # 2026-11-03) - which ``_merge_command_state`` folds into
-        # ``instant.charge``. Whether the full push also carries it is not
-        # measured yet; if it does, this sensor follows the heater by itself, and
-        # if it does not it still moves on any charge command, which is what
-        # starting the preheat from here is. Issue #31.
+        # ``instant.charge``. The full push carries it too (measured
+        # 2026-11-22), so this sensor follows the heater by itself. Issue #31.
         value_path="msg_content.instant.charge.battery_keep_warm_status",
         on_value=1,
         icon="mdi:heat-wave",

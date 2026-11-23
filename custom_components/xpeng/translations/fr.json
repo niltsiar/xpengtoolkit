@@ -343,6 +343,9 @@
       "trunk_power_timer": {
         "name": "Minuterie d'alimentation du coffre"
       },
+      "charge_session_energy": {
+        "name": "Énergie de la charge en cours"
+      },
       "last_charge_energy": {
         "name": "Énergie de la dernière charge"
       },
