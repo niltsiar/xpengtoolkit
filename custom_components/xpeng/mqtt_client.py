@@ -147,6 +147,18 @@ def is_account_takeover(notification: dict) -> bool:
         return False
     return service == ACCOUNT_TAKEOVER_SERVICE and code == ACCOUNT_TAKEOVER_CODE
 
+
+def is_account_takeover_frame(data: Any) -> bool:
+    """True when a raw push envelope (``msg_content`` still nested) is the notice."""
+    if not isinstance(data, dict) or not isinstance(data.get("msg_content"), dict):
+        return False
+    return is_account_takeover(
+        {
+            "service_type": data.get("service_type"),
+            "code": data["msg_content"].get("code"),
+        }
+    )
+
 #: Placeholders expanded in listener topics from the identity this install signs
 #: as, so an identity-scoped topic can be typed instead of pasted:
 #: ``Xp/Msg/Push/{device_id}`` (the device push channel) or
@@ -766,7 +778,7 @@ class XPengMQTTClient:
         """
         self._takeover_at = time.time()
         self._settle_refusals = 0
-        _LOGGER.info(
+        _LOGGER.debug(
             "Account signed in elsewhere%s - expecting a credential import; "
             "CONNECT retries stay quiet for %.0fs",
             f" ({message})" if message else "",
@@ -1258,7 +1270,10 @@ class XPengMQTTClient:
 
             # Push notifications (msg_type=3) — fire notification callback
             if mtype == 3:
-                _LOGGER.info(
+                log = (
+                    _LOGGER.debug if is_account_takeover_frame(data) else _LOGGER.info
+                )
+                log(
                     "Push notification: service_type=%s content=%s",
                     stype,
                     json.dumps(content) if isinstance(content, dict) else str(content)[:500],
@@ -1526,11 +1541,18 @@ class XPengMQTTClient:
         except Exception:
             payload_str = f"<binary {len(payload)} bytes>"
 
+        try:
+            data = json.loads(payload_str)
+        except (json.JSONDecodeError, ValueError):
+            data = None
+
         # One line per message is fine for a handful of topics. Against "#" - which the
         # listener accepts, and which includes the car's 1 Hz CAN broadcast - it is a log
         # flood on its own, before any of the entity work. First message per topic is INFO
-        # so a new topic is still discoverable; the rest drop to debug.
-        if topic in self._listener_logged_topics:
+        # so a new topic is still discoverable; the rest drop to debug. The takeover
+        # notice arrives on a `$client/<clientId>` topic that is new after every mint,
+        # so it would be a "first message" once per renewal.
+        if topic in self._listener_logged_topics or is_account_takeover_frame(data):
             _LOGGER.debug(
                 "Listener message on %s (%d bytes): %s",
                 topic, len(payload), payload_str[:500],
@@ -1543,12 +1565,8 @@ class XPengMQTTClient:
             )
 
         # Check for push notification (msg_type=3)
-        try:
-            data = json.loads(payload_str)
-            if isinstance(data, dict) and data.get("msg_type") == 3:
-                self._fire_notification(data)
-        except (json.JSONDecodeError, ValueError):
-            pass
+        if isinstance(data, dict) and data.get("msg_type") == 3:
+            self._fire_notification(data)
 
         if self._listener_callback:
             self._listener_callback(topic, payload_str)
@@ -1575,7 +1593,8 @@ class XPengMQTTClient:
         # key named "raw" cannot displace it; the coordinator keeps this key
         # rather than replacing it.
         notification["raw"] = dict(data)
-        _LOGGER.info("Push notification parsed: %s", notification)
+        log = _LOGGER.debug if is_account_takeover(notification) else _LOGGER.info
+        log("Push notification parsed: %s", notification)
         if self._notification_callback:
             self._notification_callback(notification)
 
