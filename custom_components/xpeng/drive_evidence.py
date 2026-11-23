@@ -48,7 +48,9 @@ _asleep_logged_at: float = 0.0
 _ASLEEP_LOG_INTERVAL_SECONDS: float = 600.0
 
 #: Shift encodings seen on this platform: strings from the MQTT push and small
-#: ints from the REST widget. 3 and 4 both mean P on the measurements we have.
+#: ints from the REST widget. 3 and 4 both end the parked verdict. 3 is R on a G6,
+#: but the verdict drives the 60 s active force-upload loop, which a reverse-park
+#: must not keep running.
 PARK_SHIFT_CODES: tuple[int, ...] = (3, 4)
 
 #: ``ext.vehicleMode`` that means the car is being driven (``const.VEHICLE_MODES``:

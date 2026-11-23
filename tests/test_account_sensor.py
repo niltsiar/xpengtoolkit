@@ -75,7 +75,7 @@ def _load_sensor_module():
     pkg = "custom_components.xpeng"
     _mod("custom_components")
     _mod(pkg, __path__=[str(COMPONENT)])
-    _mod(f"{pkg}.const", DOMAIN="xpeng", SENSOR_DESCRIPTIONS=(),
+    _mod(f"{pkg}.const", DOMAIN="xpeng", SENSOR_DESCRIPTIONS=(), G6_REVERSE_SHIFT_CODE=3,
          XPengSensorEntityDescription=_Any)
     _mod(f"{pkg}.coordinator", XPengDataCoordinator=_Any)
     error_spec = importlib.util.spec_from_file_location(

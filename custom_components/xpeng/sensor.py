@@ -21,7 +21,12 @@ from homeassistant.helpers.event import (
 )
 
 from . import poll_status
-from .const import DOMAIN, SENSOR_DESCRIPTIONS, XPengSensorEntityDescription
+from .const import (
+    DOMAIN,
+    G6_REVERSE_SHIFT_CODE,
+    SENSOR_DESCRIPTIONS,
+    XPengSensorEntityDescription,
+)
 from .coordinator import XPengDataCoordinator
 from .display_units import (
     CONF_TYRE_PRESSURE_UNIT,
@@ -167,6 +172,13 @@ class XPengSensor(XPengEntity, SensorEntity):
         raw = self._get_nested_value(self.entity_description.value_path)
         if raw is None:
             return None
+        if (
+            self.entity_description.key == "shift_state"
+            and raw == G6_REVERSE_SHIFT_CODE
+            and self.coordinator.vin_info is not None
+            and self.coordinator.vin_info.model_family == "G6"
+        ):
+            return "R"
         value = (
             self.entity_description.value_fn(raw)
             if self.entity_description.value_fn is not None else raw

@@ -119,7 +119,7 @@ Standard Range LFP pack is about 66 kWh). Driving and charging are excluded.
 | `sensor.xpeng_<vehicle>_odometer` | sensor | km | State class `total_increasing` |
 | `sensor.xpeng_<vehicle>_speed` | sensor | km/h | Rounded to 1 dp; also an attribute of the device tracker |
 | `sensor.xpeng_<vehicle>_heading` | sensor | – | Raw `interval.drive.angle`, rounded to 1 dp; no device class |
-| `sensor.xpeng_<vehicle>_shift_state` | sensor (enum) | – | `0` N, `1` D, `2` R, `3` P, `4` P; anything else is passed through as its raw string |
+| `sensor.xpeng_<vehicle>_shift_state` | sensor (enum) | – | `0` N, `1` D, `2` R, `3` R on a G6 (measured), P on other models, `4` P; anything else is passed through as its raw string |
 | `sensor.xpeng_<vehicle>_vehicle_mode` | sensor (enum) | – | `0` Parked, `1` Standby, `2` Driving; anything else is passed through raw |
 | `sensor.xpeng_<vehicle>_power_state` | sensor | – | Raw `instant.power.car_power_state`; the code declares no mapping |
 | `sensor.xpeng_<vehicle>_range_type` | sensor (enum) | – | **Diagnostic.** `1` NEDC, `2` WLTP, `3` CLTC, `4` Dynamic; unmapped → `Unknown (n)` |
