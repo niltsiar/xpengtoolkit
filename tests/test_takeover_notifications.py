@@ -25,8 +25,12 @@ not have, and the repo's structural tests check wiring the same way.
 
 from __future__ import annotations
 
+import ast
+import logging
 import pathlib
+import time
 import unittest
+from types import SimpleNamespace
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 INIT = (ROOT / "custom_components" / "xpeng" / "__init__.py").read_text(encoding="utf-8")
@@ -69,6 +73,41 @@ class TakeoverIsNotANotificationTests(unittest.TestCase):
         start = INIT.index("def _record_account_takeover")
         block = INIT[start:INIT.index("set_notification_callback", start)]
         self.assertNotIn("record_notification", block)
+
+
+class TheRecorderLogsAtDebugTests(unittest.TestCase):
+    """The recorder is nested in the setup function, so its source is run alone."""
+
+    def _recorder(self):
+        tree = ast.parse(INIT)
+        node = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_record_account_takeover"
+        )
+        status: dict = {}
+        events: list = []
+        coordinator = SimpleNamespace(
+            poll_status=status,
+            set_poll_status=lambda **fields: status.update(fields),
+        )
+        hass = SimpleNamespace(
+            bus=SimpleNamespace(async_fire=lambda name, data: events.append(name))
+        )
+        namespace = {
+            "coordinator": coordinator,
+            "hass": hass,
+            "time": time,
+            "_LOGGER": logging.getLogger("takeover_recorder_test"),
+        }
+        exec(compile(ast.Module([node], []), "__init__.py", "exec"), namespace)
+        return namespace["_record_account_takeover"], status, events
+
+    def test_the_takeover_recorder_logs_at_debug(self):
+        record, status, events = self._recorder()
+        with self.assertNoLogs(level="INFO"):
+            record({"code": 4003007})
+        self.assertEqual(status["account_takeovers"], 1)
+        self.assertEqual(events, ["xpeng_account_takeover"])
 
 
 class PollingStatusExposesTheTakeoverTests(unittest.TestCase):

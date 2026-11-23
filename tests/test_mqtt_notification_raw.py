@@ -20,6 +20,7 @@ rest of the suite uses for `cryptography`.
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
 import sys
 import types
@@ -128,6 +129,81 @@ class TestPushRawRecord(unittest.TestCase):
         self.assertIsInstance(raw, dict)
         self.assertEqual(raw["msg_id"], "m")
         self.assertEqual(raw["msg_content"]["raw"], "from content")
+
+
+TAKEOVER = {
+    "msg_type": 3,
+    "service_type": 17,
+    "msg_id": "m1",
+    "msg_content": {"code": 4003007, "msg": "Account logged in on another device"},
+}
+OTHER = {
+    "msg_type": 3,
+    "service_type": 12,
+    "msg_id": "m2",
+    "msg_content": {"code": 0, "msg": "Window open"},
+}
+
+
+class _Msg:
+    qos = 0
+    retain = False
+
+    def __init__(self, topic: str, body: dict) -> None:
+        self.topic = topic
+        self.payload = json.dumps(body).encode("utf-8")
+
+
+class TestTakeoverIsQuietInTheLog(unittest.TestCase):
+    """Every renewal sends one takeover notice; none of it may reach INFO."""
+
+    CLIENT_TOPIC = "$client/xmart:app:1:abc"
+
+    def test_a_takeover_frame_on_the_client_topic_logs_nothing_above_debug(self):
+        client, _received = _client()
+        msg = _Msg(self.CLIENT_TOPIC, TAKEOVER)
+        with self.assertNoLogs(level="INFO"):
+            client._on_message(None, None, msg)
+
+    def test_a_takeover_frame_on_the_primary_topic_logs_nothing_above_debug(self):
+        client, _received = _client()
+        msg = _Msg(client.recv_topic, TAKEOVER)
+        with self.assertNoLogs(level="INFO"):
+            client._on_message(None, None, msg)
+
+    def test_a_takeover_still_reaches_the_notification_callback(self):
+        for topic in (self.CLIENT_TOPIC, None):
+            with self.subTest(topic=topic):
+                client, received = _client()
+                client._on_message(None, None, _Msg(topic or client.recv_topic, TAKEOVER))
+                self.assertEqual(len(received), 1)
+                self.assertEqual(received[0]["code"], 4003007)
+                self.assertTrue(mqtt_client.is_account_takeover(received[0]))
+
+    def test_other_push_notifications_still_log_at_info(self):
+        for topic in (self.CLIENT_TOPIC, None):
+            with self.subTest(topic=topic):
+                client, received = _client()
+                msg = _Msg(topic or client.recv_topic, OTHER)
+                with self.assertLogs(level="INFO") as logs:
+                    client._on_message(None, None, msg)
+                self.assertTrue(
+                    any("Push notification parsed" in line for line in logs.output)
+                )
+                self.assertEqual(len(received), 1)
+
+    def test_note_account_takeover_logs_at_debug_and_still_opens_the_grace(self):
+        client, _received = _client()
+        self.assertFalse(client.settling)
+        with self.assertNoLogs(level="INFO"):
+            client.note_account_takeover("signed in elsewhere")
+        self.assertTrue(client.settling)
+
+    def test_the_envelope_form_is_read_through_msg_content(self):
+        self.assertTrue(mqtt_client.is_account_takeover_frame(TAKEOVER))
+        self.assertFalse(mqtt_client.is_account_takeover_frame(OTHER))
+        for junk in (None, [], {"msg_content": "x"}, {"service_type": 17}):
+            self.assertFalse(mqtt_client.is_account_takeover_frame(junk), junk)
 
 
 if __name__ == "__main__":

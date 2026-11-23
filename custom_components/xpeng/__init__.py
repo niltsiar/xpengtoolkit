@@ -1135,9 +1135,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         user actually wants behind a dozen "Account logged in on another device"
         entries a day (measured 2026-10-18 on `.162`: count 12, every one a
         renewal, and the Last-notification sensor never showed anything else).
-        The takeover is still visible where it belongs: its own bus event, the
-        INFO line the client logs, and `last_takeover_at` / `account_takeovers` on
-        the polling-status sensor.
+        The takeover is still visible where it belongs: its own bus event, and
+        `last_takeover_at` / `account_takeovers` on the polling-status sensor.
+        Every log line about it is DEBUG, because each renewal sends one.
         """
         now = time.time()
         count = int(coordinator.poll_status.get("account_takeovers") or 0) + 1
@@ -1149,7 +1149,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         notice["source"] = "mqtt"
         notice["timestamp"] = now
         hass.bus.async_fire("xpeng_account_takeover", notice)
-        _LOGGER.info(
+        _LOGGER.debug(
             "Account takeover notice #%d recorded (the renewal app logging in; "
             "expecting a credential import)", count,
         )
