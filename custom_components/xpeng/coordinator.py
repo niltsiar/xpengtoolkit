@@ -486,6 +486,7 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         has_door_data = data.pop("has_door_data", False)
         has_window_data = data.pop("has_window_data", False)
         has_drive_data = data.pop("has_drive_data", False)
+        has_interval_drive_data = data.pop("has_interval_drive_data", False)
         # Held before anything below replaces it: whether this frame moved an
         # energy value is decided against the state it is replacing.
         previous = self._last_full_data
@@ -522,11 +523,12 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         data = with_previous_charge(data, self._last_full_data)
         self._last_full_data = data
         self.last_data_timestamp = datetime.now(timezone.utc)
-        self.gps_fix.observe(data, self.last_data_timestamp.timestamp())
+        fixed_at = self.last_data_timestamp.timestamp() if has_interval_drive_data else None
+        self.gps_fix.observe(data, fixed_at)
         # Before _update_parked_consumption, which reads vehicle_parked; and
         # before the entities are notified, so a transition is logged with the
         # evidence that caused it (issue #3 diagnostics).
-        self.note_drive_evidence(data, has_drive_data)
+        self.note_drive_evidence(data, has_drive_data, has_interval_drive_data)
         if has_fresh_energy_data and energy_moved(data, previous):
             # A repeated full snapshot is the fan-out replaying itself, not the
             # car reporting: do not let it hold the fallback gate shut (#34).
@@ -1586,7 +1588,10 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return drive_view(self._last_full_data)
 
     def note_drive_evidence(
-        self, data: dict[str, Any], has_drive_data: bool
+        self,
+        data: dict[str, Any],
+        has_drive_data: bool,
+        has_interval_drive_data: bool,
     ) -> None:
         """Record whether the frame just accepted showed the car moving.
 
@@ -1598,12 +1603,16 @@ class XPengDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         allowance. A partial without its own ``instant.drive`` is merged onto
         the held state, so its P verdict is the baseline's and says nothing
         about this frame; it leaves the evidence alone, as does a frame with no
-        drive block at all: no evidence is not evidence of parking.
+        drive block at all: no evidence is not evidence of parking. The
+        ``interval.drive`` speed counts only in a frame that carried its own
+        block; a held non-P shift still counts. A P under a held speed above 0
+        neither renews nor clears: that evidence armed the wake that caught a
+        drive starting three minutes after a stop (2026-11-22).
         """
         view = drive_view(data)
-        if view["moving"]:
+        if view["parked"] is False or (has_interval_drive_data and view["moving"]):
             self.last_motion_at = time.time()
-        elif has_drive_data and view["parked"]:
+        elif has_drive_data and view["parked"] and not view["moving"]:
             self.last_motion_at = 0.0
 
     @property

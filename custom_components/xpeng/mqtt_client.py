@@ -1347,6 +1347,13 @@ class XPengMQTTClient:
                 )
             )
             initial_partial = baseline is None and has_initial_state
+            frame_interval = content.get("interval")
+            # Only this frame's own block: a held speed or position is as old as
+            # the frame that sent it, and must not renew motion evidence or the
+            # GPS fix age.
+            has_interval_drive_data = isinstance(frame_interval, dict) and bool(
+                frame_interval.get("drive")
+            )
 
             if is_full or initial_partial:
                 soc = instant.get("charge", {}).get("battery_soc") if instant.get("charge") else None
@@ -1360,6 +1367,26 @@ class XPengMQTTClient:
                     json.dumps(protect),
                     list(instant.keys()),
                 )
+                # The full test passes on a frame with only ext and charge (a G6
+                # sent one on 2026-11-22), and replacing the held state blanked the
+                # odometer, gear, speed and GPS. Keep the sections it leaves out.
+                if baseline is not None:
+                    held_instant = baseline.get("instant") or {}
+                    carried = {
+                        key: held_instant[key]
+                        for key in ("drive", "odometer")
+                        if not instant.get(key) and held_instant.get(key)
+                    }
+                    if carried:
+                        content = {**content, "instant": {**instant, **carried}}
+                    # Only the position and speed: a held interval.charge.power would
+                    # read as a running charge after the session ended.
+                    held_drive = (baseline.get("interval") or {}).get("drive")
+                    if held_drive and not has_interval_drive_data:
+                        content = {
+                            **content,
+                            "interval": {**(frame_interval or {}), "drive": held_drive},
+                        }
                 # Pass the full parsed data to the coordinator callback. It may
                 # refuse the state as a replay of an older snapshot (see
                 # replay_guard.py); only an accepted message may become the
@@ -1381,6 +1408,7 @@ class XPengMQTTClient:
                     # parking: ``interval.drive`` rides in every partial with
                     # speed 0, and a merged partial inherits the baseline's.
                     "has_drive_data": bool(instant.get("drive")),
+                    "has_interval_drive_data": has_interval_drive_data,
                 }
                 if self._state_callback is None or self._state_callback(vehicle_data) is not False:
                     # Store as last full content for merging with partial responses
@@ -1470,6 +1498,7 @@ class XPengMQTTClient:
                     "has_door_data": bool(instant.get("door")),
                     "has_window_data": bool(instant.get("window")),
                     "has_drive_data": bool(instant.get("drive")),
+                    "has_interval_drive_data": has_interval_drive_data,
                 }
                 # A partial can carry the stale snapshot's charge too, so the
                 # same acceptance test applies: a refused state must not stamp
