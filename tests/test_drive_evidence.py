@@ -485,7 +485,10 @@ class TheIntegrationActuallyUsesIt(unittest.TestCase):
         self.assertIn("with_previous_fix", coordinator)
         self.assertIn('return drive_view(self._last_full_data)["parked"]', coordinator)
         self.assertIn("def parking_view", coordinator)
-        self.assertIn("self.note_drive_evidence(data, has_drive_data)", coordinator)
+        self.assertIn(
+            "self.note_drive_evidence(data, has_drive_data, has_interval_drive_data)",
+            coordinator,
+        )
         self.assertIn("data = with_previous_fix(data, self._last_full_data)", coordinator)
         self.assertIn("self.gps_fix.observe(data,", coordinator)
 

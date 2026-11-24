@@ -179,6 +179,87 @@ class RealChangesStillArrive(unittest.TestCase):
         self.assertEqual(calls[0]["msg_content"]["interval"]["charge"]["power"], 0)
 
 
+#: A G6 full state: every instant section the frames below touch, plus both
+#: interval blocks with a valid fix.
+HELD_FULL = {
+    "code": 200,
+    "instant": {
+        "charge": {"battery_soc": 90, "charging_state": 2},
+        "drive": {"shift_state": 4, "speed": 0},
+        "ext": {"vehicleMode": 0},
+        "odometer": {"total_mileage": 30000},
+    },
+    "interval": {
+        "charge": {"power": 3.5},
+        "drive": {"speed": "0.000000", "latitude": -32.0, "longitude": 152.0, "coordValid": 1},
+    },
+}
+
+#: Measured 2026-11-22: a 2,894 B frame with ``ext`` and ``charge`` but no
+#: drive, odometer or interval passed the full-state test, and the odometer,
+#: gear and speed read unknown for six minutes until the next full frame.
+EXT_AND_CHARGE_ONLY = _state(
+    instant={
+        "ext": {"vehicleMode": 0},
+        "charge": {"battery_soc": 89, "charging_state": 8},
+    }
+)
+
+
+class AFullFrameKeepsTheSectionsItLeavesOut(unittest.TestCase):
+    def test_a_full_frame_without_drive_keeps_the_held_drive_block(self):
+        client, calls = _client(HELD_FULL)
+        client._on_message(None, None, _Msg(EXT_AND_CHARGE_ONLY))
+        self.assertEqual(len(calls), 1)
+        instant = calls[0]["msg_content"]["instant"]
+        self.assertEqual(instant["drive"], HELD_FULL["instant"]["drive"])
+        self.assertEqual(instant["odometer"], HELD_FULL["instant"]["odometer"])
+        self.assertEqual(instant["charge"], {"battery_soc": 89, "charging_state": 8})
+        self.assertEqual(
+            client._last_full_content["instant"]["drive"], HELD_FULL["instant"]["drive"]
+        )
+        self.assertFalse(calls[0]["has_drive_data"])
+
+    def test_a_full_frame_without_interval_keeps_only_the_held_interval_drive(self):
+        client, calls = _client(HELD_FULL)
+        client._on_message(None, None, _Msg(EXT_AND_CHARGE_ONLY))
+        expected = {"drive": HELD_FULL["interval"]["drive"]}
+        self.assertEqual(calls[0]["msg_content"]["interval"], expected)
+        self.assertEqual(client._last_full_content["interval"], expected)
+        self.assertFalse(calls[0]["has_interval_drive_data"])
+
+    def test_a_full_frame_with_only_interval_charge_keeps_the_held_interval_drive(self):
+        client, calls = _client(HELD_FULL)
+        frame = _state(
+            instant=EXT_AND_CHARGE_ONLY["msg_content"]["instant"],
+            interval={"charge": {"power": 0}},
+        )
+        client._on_message(None, None, _Msg(frame))
+        self.assertEqual(
+            calls[0]["msg_content"]["interval"],
+            {"charge": {"power": 0}, "drive": HELD_FULL["interval"]["drive"]},
+        )
+        self.assertFalse(calls[0]["has_interval_drive_data"])
+
+    def test_a_real_full_frame_replaces_every_section_it_carries(self):
+        client, calls = _client(HELD_FULL)
+        frame = {
+            "instant": {
+                "charge": {"battery_soc": 80},
+                "drive": {"shift_state": 1},
+                "ext": {"vehicleMode": 2},
+                "odometer": {"total_mileage": 30042},
+            },
+            "interval": {"drive": {"speed": "55.000000"}},
+        }
+        client._on_message(None, None, _Msg(_state(**frame)))
+        content = calls[0]["msg_content"]
+        self.assertEqual(content["instant"], frame["instant"])
+        self.assertEqual(content["interval"], frame["interval"])
+        self.assertTrue(calls[0]["has_drive_data"])
+        self.assertTrue(calls[0]["has_interval_drive_data"])
+
+
 class UnsentCommandsAreReported(unittest.TestCase):
     """A command that never went out must raise, not return."""
 

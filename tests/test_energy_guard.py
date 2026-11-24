@@ -532,6 +532,7 @@ class TheWatchdogAnswerIsNotMarkedSpecial(unittest.TestCase):
                     "has_door_data",
                     "has_drive_data",
                     "has_fresh_energy_data",
+                    "has_interval_drive_data",
                     "has_window_data",
                     "msg_content",
                     "vin",
@@ -590,6 +591,91 @@ class AFrameClearsMotionEvidenceOnlyWithItsOwnDriveBlock(unittest.TestCase):
         self.assertTrue(calls[-1]["has_drive_data"])
         self.assertTrue(coord.set_vehicle_data(calls[-1]))
         self.assertEqual(coord.last_motion_at, 0.0)
+
+
+class OnlyTheFramesOwnIntervalIsFresh(unittest.TestCase):
+    """A held ``interval.drive`` rides in every merged state, and in a full
+    frame that left the block out. Its speed and position are as old as the
+    frame that sent them, so only a frame with its own block may renew motion
+    evidence or the fix age.
+    """
+
+    def _pipeline(self, held_drive, held_speed="0.000000"):
+        import test_mqtt_state_delivery as delivery
+
+        held = {
+            "code": 200,
+            "instant": {
+                "charge": {"battery_soc": 90},
+                "drive": held_drive,
+                "ext": {"vehicleMode": 0},
+                "odometer": {"total_mileage": 30000},
+            },
+            "interval": {
+                "drive": {
+                    "speed": held_speed,
+                    "latitude": -32.0,
+                    "longitude": 152.0,
+                    "coordValid": 1,
+                },
+            },
+        }
+        client, _calls = delivery._client(held)
+        coord = _coordinator_with({"msg_content": held, "vin": "TESTVIN0000000000"})
+        client.set_state_callback(coord.set_vehicle_data)
+        return client, coord, delivery
+
+    def test_a_carried_interval_speed_is_not_motion_evidence(self):
+        client, coord, delivery = self._pipeline({"shift_state": 4}, held_speed="42.000000")
+        client._on_message(None, None, delivery._Msg(delivery.EXT_AND_CHARGE_ONLY))
+        carried = coord.last_full_data["msg_content"]["interval"]["drive"]
+        self.assertEqual(carried["speed"], "42.000000")
+        self.assertEqual(coord.last_motion_at, 0.0)
+
+    def test_a_carried_gps_keeps_its_old_fix_age(self):
+        client, coord, delivery = self._pipeline({"shift_state": 4})
+        coord.gps_fix.observe(coord.last_full_data, 1000.0)
+        client._on_message(None, None, delivery._Msg(delivery.EXT_AND_CHARGE_ONLY))
+        self.assertEqual(coord.gps_fix.position, (-32.0, 152.0))
+        self.assertEqual(coord.gps_fix.fixed_at, 1000.0)
+        own_fix = {"drive": {"latitude": -32.5, "longitude": 152.5, "coordValid": 1}}
+        client._on_message(None, None, delivery._Msg(delivery._state(interval=own_fix)))
+        self.assertGreater(coord.gps_fix.fixed_at, 1000.0)
+
+    def test_a_charge_only_partial_leaves_the_fix_age_alone(self):
+        client, coord, delivery = self._pipeline({"shift_state": 4})
+        coord.gps_fix.observe(coord.last_full_data, 1000.0)
+        frame = delivery._state(interval={"charge": {"power": 0}})
+        client._on_message(None, None, delivery._Msg(frame))
+        self.assertEqual(coord.gps_fix.fixed_at, 1000.0)
+
+    def test_a_full_frame_after_a_charge_does_not_read_as_charging(self):
+        import test_mqtt_state_delivery as delivery
+
+        client, calls = delivery._client(delivery.HELD_FULL)
+        self.assertGreater(delivery.HELD_FULL["interval"]["charge"]["power"], 0)
+        client._on_message(None, None, delivery._Msg(delivery.EXT_AND_CHARGE_ONLY))
+        self.assertFalse(energy_guard.state_is_charging(calls[0]))
+
+    def test_an_interval_drive_frame_with_speed_still_sets_motion_evidence(self):
+        client, coord, delivery = self._pipeline({"shift_state": 4})
+        frame = delivery._state(interval={"drive": {"speed": "30.000000"}})
+        client._on_message(None, None, delivery._Msg(frame))
+        self.assertGreater(coord.last_motion_at, 0.0)
+
+    def test_a_p_under_a_held_speed_neither_renews_nor_clears_motion_evidence(self):
+        client, coord, delivery = self._pipeline({"shift_state": 1}, held_speed="2.030000")
+        coord.last_motion_at = 123.0
+        frame = delivery._state(instant={"drive": {"shift_state": 4}})
+        client._on_message(None, None, delivery._Msg(frame))
+        self.assertIs(coord.parking_view["parked"], True)
+        self.assertEqual(coord.last_motion_at, 123.0)
+
+    def test_a_held_d_still_renews_motion_evidence(self):
+        client, coord, delivery = self._pipeline({"shift_state": 1})
+        frame = delivery._state(instant={"hvac": {"inner_temp": 18}})
+        client._on_message(None, None, delivery._Msg(frame))
+        self.assertGreater(coord.last_motion_at, 0.0)
 
 
 class TheFallbackGateHasOneDefinition(unittest.TestCase):
